@@ -242,11 +242,14 @@ async def analise_automatica():
 
 @tasks.loop(hours=24)
 async def noticias_diarias():
-    if not config.NEWS_ATIVAS or not config.CANAL_ANALISE:
+    if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
-    canal = bot.get_channel(config.CANAL_ANALISE)
+
+    canal = bot.get_channel(config.CANAL_NOTICIAS)
+
     for titulo in news.noticias():
         await canal.send(titulo)
+
 
 # ───── START ─────
 
