@@ -39,11 +39,5 @@ INTERVALO_MINUTOS = 360
 NEWS_ATIVAS = True
 
 CANAL_ANALISE = None
-
 CANAL_NOTICIAS = None
-# ───── COMANDOS ADMIN ─────
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setcanalnoticias(ctx):
-    config.CANAL_NOTICIAS = ctx.channel.id
-    await ctx.send("📰 Canal de notícias definido com sucesso")
+
