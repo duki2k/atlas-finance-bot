@@ -95,7 +95,7 @@ async def alerta(ctx, ativo, valor: float):
 async def help(ctx):
     embed = discord.Embed(
         title="🤖 Atlas Finance Bot — Comandos",
-        description="Bot hobby para acompanhar o mercado financeiro 📈",
+        description="Acompanhe o mercado financeiro 📈",
         color=0x00ff99
     )
 
@@ -124,7 +124,7 @@ async def help(ctx):
         inline=False
     )
 
-    embed.set_footer(text="Bot hobby • uso educativo")
+    embed.set_footer(text="Atlas Community ® 2026")
 
     await ctx.send(embed=embed)
 
