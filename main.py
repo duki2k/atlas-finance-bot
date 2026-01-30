@@ -80,7 +80,38 @@ async def tendencia(ctx, ativo):
 
 @bot.command()
 async def ativos(ctx):
-    await ctx.send("📌 Ativos monitorados:\n" + ", ".join(config.ATIVOS))
+    criptos = []
+    acoes = []
+
+    for ativo in config.ATIVOS:
+        if ativo.endswith("-USD"):
+            criptos.append(ativo)
+        else:
+            acoes.append(ativo)
+
+    embed = discord.Embed(
+        title="📊 Ativos Monitorados",
+        description="Lista de ativos acompanhados pelo bot",
+        color=0x5865F2
+    )
+
+    if criptos:
+        embed.add_field(
+            name="🪙 Criptomoedas",
+            value=" • ".join(criptos),
+            inline=False
+        )
+
+    if acoes:
+        embed.add_field(
+            name="📈 Ações",
+            value=" • ".join(acoes),
+            inline=False
+        )
+
+    embed.set_footer(text=f"Total de ativos: {len(config.ATIVOS)}")
+
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def alerta(ctx, ativo, valor: float):
