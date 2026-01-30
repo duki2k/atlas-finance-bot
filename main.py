@@ -163,6 +163,12 @@ async def help(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
+async def setcanalnoticias(ctx):
+    config.CANAL_NOTICIAS = ctx.channel.id
+    await ctx.send("📰 Canal de notícias definido com sucesso.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
 async def setcanal(ctx):
     config.CANAL_ANALISE = ctx.channel.id
     await ctx.send("✅ Canal de análises definido.")
