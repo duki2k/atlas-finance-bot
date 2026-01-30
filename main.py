@@ -29,6 +29,23 @@ async def preco(ctx, ativo):
         await ctx.send("❌ Ativo inválido")
 
 @bot.command()
+async def preco(ctx, ativo):
+    try:
+        p = market.preco_atual(ativo)
+
+        embed = discord.Embed(
+            title=f"💰 Preço do ativo",
+            description=f"**{ativo}**",
+            color=0x3498db
+        )
+        embed.add_field(name="Preço atual", value=f"{p:.2f}", inline=False)
+
+        await ctx.send(embed=embed)
+    except:
+        await ctx.send("❌ Ativo inválido")
+
+
+@bot.command()
 async def analise(ctx, ativo):
     try:
         p = market.preco_atual(ativo)
