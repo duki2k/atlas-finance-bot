@@ -4,6 +4,8 @@ from discord.ext import commands, tasks
 import config
 import market
 import news
+from datetime import time, timedelta
+import pytz
 
 # ───── CONFIGURAÇÃO BÁSICA ─────
 
