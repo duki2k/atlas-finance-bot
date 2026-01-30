@@ -1,0 +1,216 @@
+import os
+import discord
+from discord.ext import commands, tasks
+import config
+import market
+import news
+
+# ───── CONFIGURAÇÃO BÁSICA ─────
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+# desativa o help padrão do discord
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
+
+# ───── ALERTAS ─────
+
+ALERTAS = []
+
+# ───── EVENTOS ─────
+
+@bot.event
+async def on_ready():
+    print("🤖 Bot hobby ligado")
+    if not analise_automatica.is_running():
+        analise_automatica.start()
+    if not noticias_diarias.is_running():
+        noticias_diarias.start()
+    if not verificar_alertas.is_running():
+        verificar_alertas.start()
+
+# ───── COMANDOS USUÁRIO ─────
+
+@bot.command()
+async def preco(ctx, ativo):
+    try:
+        preco = market.preco_atual(ativo)
+        embed = discord.Embed(
+            title="💰 Preço do ativo",
+            description=f"**{ativo}**",
+            color=0x3498db
+        )
+        embed.add_field(name="Preço atual", value=f"{preco:.2f}", inline=False)
+        await ctx.send(embed=embed)
+    except:
+        await ctx.send("❌ Não consegui encontrar esse ativo.")
+
+@bot.command()
+async def analise(ctx, ativo):
+    try:
+        preco = market.preco_atual(ativo)
+        rsi = market.rsi(ativo)
+        tendencia = market.tendencia(ativo)
+
+        embed = discord.Embed(
+            title=f"📊 Análise — {ativo}",
+            color=0x2ecc71
+        )
+        embed.add_field(name="Preço", value=f"{preco:.2f}", inline=True)
+        embed.add_field(name="RSI", value=f"{rsi:.1f}", inline=True)
+        embed.add_field(name="Tendência", value=tendencia, inline=False)
+
+        await ctx.send(embed=embed)
+    except:
+        await ctx.send("❌ Erro ao analisar esse ativo.")
+
+@bot.command()
+async def tendencia(ctx, ativo):
+    try:
+        tendencia = market.tendencia(ativo)
+        await ctx.send(f"📈 **{ativo}** → {tendencia}")
+    except:
+        await ctx.send("❌ Ativo inválido.")
+
+@bot.command()
+async def ativos(ctx):
+    await ctx.send("📌 Ativos monitorados:\n" + ", ".join(config.ATIVOS))
+
+@bot.command()
+async def alerta(ctx, ativo, valor: float):
+    ALERTAS.append({
+        "ativo": ativo,
+        "valor": valor,
+        "canal": ctx.channel.id
+    })
+    await ctx.send(f"🚨 Alerta criado para **{ativo}** em `{valor}`")
+
+@bot.command()
+async def help(ctx):
+    embed = discord.Embed(
+        title="🤖 Atlas Finance Bot — Comandos",
+        description="Bot hobby para acompanhar o mercado financeiro 📈",
+        color=0x00ff99
+    )
+
+    embed.add_field(
+        name="👥 Comandos para todos",
+        value=(
+            "!preco ATIVO\n"
+            "!analise ATIVO\n"
+            "!tendencia ATIVO\n"
+            "!ativos\n"
+            "!alerta ATIVO VALOR"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="👑 Comandos admin",
+        value=(
+            "!setcanal\n"
+            "!add ATIVO\n"
+            "!remove ATIVO\n"
+            "!intervalo MIN\n"
+            "!news on\n"
+            "!news off"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Bot hobby • uso educativo")
+
+    await ctx.send(embed=embed)
+
+# ───── COMANDOS ADMIN ─────
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanal(ctx):
+    config.CANAL_ANALISE = ctx.channel.id
+    await ctx.send("✅ Canal de análises definido.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def add(ctx, ativo):
+    if ativo not in config.ATIVOS:
+        config.ATIVOS.append(ativo)
+        await ctx.send(f"✅ {ativo} adicionado.")
+    else:
+        await ctx.send("⚠️ Esse ativo já está na lista.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def remove(ctx, ativo):
+    if ativo in config.ATIVOS:
+        config.ATIVOS.remove(ativo)
+        await ctx.send(f"🗑️ {ativo} removido.")
+    else:
+        await ctx.send("⚠️ Esse ativo não está na lista.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def intervalo(ctx, minutos: int):
+    config.INTERVALO_MINUTOS = minutos
+    analise_automatica.change_interval(minutes=minutos)
+    await ctx.send(f"⏱️ Intervalo alterado para {minutos} minutos.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def news_on(ctx):
+    config.NEWS_ATIVAS = True
+    await ctx.send("📰 Notícias ativadas.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def news_off(ctx):
+    config.NEWS_ATIVAS = False
+    await ctx.send("📰 Notícias desativadas.")
+
+# ───── TAREFAS AUTOMÁTICAS ─────
+
+@tasks.loop(minutes=5)
+async def verificar_alertas():
+    for alerta in ALERTAS[:]:
+        try:
+            preco = market.preco_atual(alerta["ativo"])
+            if preco >= alerta["valor"]:
+                canal = bot.get_channel(alerta["canal"])
+                mensagem = (
+                    "🚨 **ALERTA ATINGIDO**\n"
+                    f"{alerta['ativo']} chegou a {preco:.2f}"
+                )
+                await canal.send(mensagem)
+                ALERTAS.remove(alerta)
+        except:
+            pass
+
+@tasks.loop(minutes=config.INTERVALO_MINUTOS)
+async def analise_automatica():
+    if not config.CANAL_ANALISE:
+        return
+    canal = bot.get_channel(config.CANAL_ANALISE)
+    for ativo in config.ATIVOS:
+        try:
+            preco = market.preco_atual(ativo)
+            await canal.send(f"📈 {ativo} → {preco:.2f}")
+        except:
+            pass
+
+@tasks.loop(hours=24)
+async def noticias_diarias():
+    if not config.NEWS_ATIVAS or not config.CANAL_ANALISE:
+        return
+    canal = bot.get_channel(config.CANAL_ANALISE)
+    for titulo in news.noticias():
+        await canal.send(titulo)
+
+# ───── START ─────
+
+bot.run(TOKEN)
