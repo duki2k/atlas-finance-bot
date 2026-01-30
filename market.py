@@ -1,27 +1,92 @@
 import yfinance as yf
-import pandas as pd
+import requests
 
-def _get_history(ativo, periodo="1d"):
-    ticker = yf.Ticker(ativo)
-    hist = ticker.history(period=periodo)
+# ─────────────────────────────
+# MAPAS
+# ─────────────────────────────
 
-    if hist is None or hist.empty:
-        return None
+CRYPTO_MAP = {
+    "BTC-USD": "bitcoin",
+    "ETH-USD": "ethereum",
+    "USDT-USD": "tether",
+    "BNB-USD": "binancecoin",
+    "XRP-USD": "ripple",
+    "ADA-USD": "cardano",
+    "SOL-USD": "solana"
+}
 
-    return hist
+# alguns tickers precisam ser tratados explicitamente
+STOCK_MAP = {
+    "META": "META",
+    "GOOGL": "GOOGL",
+    "BRK-B": "BRK-B",
+}
+
+# ─────────────────────────────
+# FUNÇÕES DE CRIPTO
+# ─────────────────────────────
+
+def _preco_crypto(ativo):
+    coin_id = CRYPTO_MAP.get(ativo)
+    if not coin_id:
+        raise ValueError("Cripto não mapeada")
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd"
+    }
+
+    r = requests.get(url, params=params, timeout=10).json()
+    return float(r[coin_id]["usd"])
+
+# ─────────────────────────────
+# FUNÇÕES DE AÇÕES
+# ─────────────────────────────
+
+def _preco_acao(ativo):
+    ticker = STOCK_MAP.get(ativo, ativo)
+
+    df = yf.download(
+        ticker,
+        period="1d",
+        progress=False,
+        threads=False
+    )
+
+    if df is None or df.empty:
+        raise ValueError("Sem dados da ação")
+
+    return float(df["Close"].iloc[-1])
+
+# ─────────────────────────────
+# FUNÇÃO PRINCIPAL (USADA PELO BOT)
+# ─────────────────────────────
 
 def preco_atual(ativo):
-    hist = _get_history(ativo, "1d")
-    if hist is None:
-        raise ValueError("Sem dados para o ativo")
-    return float(hist["Close"].iloc[-1])
+    if ativo.endswith("-USD"):
+        return _preco_crypto(ativo)
+    return _preco_acao(ativo)
+
+# ─────────────────────────────
+# INDICADORES (APENAS AÇÕES)
+# ─────────────────────────────
 
 def rsi(ativo, periodo=14):
-    hist = _get_history(ativo, "1mo")
-    if hist is None or len(hist) < periodo:
-        raise ValueError("Dados insuficientes")
+    if ativo.endswith("-USD"):
+        raise ValueError("RSI não disponível para cripto")
 
-    delta = hist["Close"].diff()
+    df = yf.download(
+        ativo,
+        period="1mo",
+        progress=False,
+        threads=False
+    )
+
+    if df is None or df.empty:
+        raise ValueError("Sem dados suficientes")
+
+    delta = df["Close"].diff()
     ganho = delta.clip(lower=0)
     perda = -delta.clip(upper=0)
 
@@ -33,13 +98,23 @@ def rsi(ativo, periodo=14):
 
     return float(rsi.iloc[-1])
 
-def tendencia(ativo):
-    hist = _get_history(ativo, "5d")
-    if hist is None or len(hist) < 2:
-        raise ValueError("Dados insuficientes")
 
-    inicio = hist["Close"].iloc[0]
-    fim = hist["Close"].iloc[-1]
+def tendencia(ativo):
+    if ativo.endswith("-USD"):
+        raise ValueError("Tendência não disponível para cripto")
+
+    df = yf.download(
+        ativo,
+        period="5d",
+        progress=False,
+        threads=False
+    )
+
+    if df is None or df.empty or len(df) < 2:
+        raise ValueError("Sem dados suficientes")
+
+    inicio = df["Close"].iloc[0]
+    fim = df["Close"].iloc[-1]
 
     if fim > inicio:
         return "Alta 📈"
