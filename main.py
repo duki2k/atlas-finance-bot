@@ -254,9 +254,79 @@ async def noticias_diarias():
         return
 
     canal = bot.get_channel(config.CANAL_NOTICIAS)
+    noticias = news.noticias()
 
-    for titulo in news.noticias():
-        await canal.send(titulo)
+    if not noticias:
+        return
+
+    # ───── CLASSIFICAÇÃO SIMPLES DO MERCADO ─────
+    texto_completo = " ".join(noticias).lower()
+
+    palavras_negativas = ["queda", "cai", "recuo", "tensão", "crise", "volatilidade", "inflação"]
+    palavras_positivas = ["alta", "sobe", "ganho", "otimismo", "recuperação", "avanço"]
+
+    score = 0
+    for p in palavras_positivas:
+        if p in texto_completo:
+            score += 1
+    for p in palavras_negativas:
+        if p in texto_completo:
+            score -= 1
+
+    if score >= 2:
+        leitura = "🟢 Mercado com viés positivo"
+        recomendacao = (
+            "📈 **Postura construtiva**\n"
+            "• Buscar oportunidades com gestão de risco\n"
+            "• Priorizar ativos líquidos\n"
+            "• Evitar excesso de alavancagem"
+        )
+    elif score <= -2:
+        leitura = "🔴 Mercado defensivo"
+        recomendacao = (
+            "⚠️ **Postura defensiva**\n"
+            "• Preservar capital\n"
+            "• Evitar operações impulsivas\n"
+            "• Priorizar proteção e liquidez"
+        )
+    else:
+        leitura = "🟡 Mercado indefinido"
+        recomendacao = (
+            "⏳ **Postura cautelosa**\n"
+            "• Aguardar confirmação de tendência\n"
+            "• Operar com menor exposição\n"
+            "• Foco em gestão de risco"
+        )
+
+    # ───── EMBED JORNAL ─────
+    embed = discord.Embed(
+        title="🗞️ Jornal do Mercado Global — Abertura",
+        color=0xF39C12
+    )
+
+    embed.add_field(
+        name="🌍 Principais Destaques",
+        value="\n".join(f"• {n}" for n in noticias[:5]),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Leitura do Mercado",
+        value=leitura,
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧠 Recomendação do Bot",
+        value=recomendacao,
+        inline=False
+    )
+
+    embed.set_footer(
+        text="Atualizado às 06:00 • Conteúdo educacional • Não é recomendação financeira"
+    )
+
+    await canal.send(embed=embed)
 
 
 
