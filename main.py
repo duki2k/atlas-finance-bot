@@ -30,12 +30,16 @@ ALERTAS = []
 @bot.event
 async def on_ready():
     print("🤖 Bot hobby ligado")
+
     if not analise_automatica.is_running():
         analise_automatica.start()
+
     if not noticias_diarias.is_running():
         noticias_diarias.start()
+
     if not verificar_alertas.is_running():
         verificar_alertas.start()
+
 
 # ───── COMANDOS USUÁRIO ─────
 
