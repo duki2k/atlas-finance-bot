@@ -2,19 +2,24 @@ import feedparser
 
 GOOGLE_NEWS_RSS = (
     "https://news.google.com/rss/search"
-    "?q=mercado+financeiro+bolsas+mundiais"
+    "?q=bolsas+mundiais+mercado+financeiro+wall+street"
     "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
 )
 
 def noticias():
-    feed = feedparser.parse(GOOGLE_NEWS_RSS)
+    try:
+        feed = feedparser.parse(GOOGLE_NEWS_RSS)
 
-    if not feed.entries:
+        if not feed.entries:
+            return []
+
+        titulos = []
+        for entry in feed.entries[:8]:
+            if hasattr(entry, "title"):
+                titulos.append(entry.title)
+
+        return titulos
+
+    except Exception as e:
+        print("Erro no news.py:", e)
         return []
-
-    noticias = []
-    for entry in feed.entries[:8]:
-        titulo = entry.title
-        noticias.append(titulo)
-
-    return noticias
