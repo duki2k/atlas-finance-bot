@@ -1,16 +1,20 @@
-import requests
+import feedparser
+
+GOOGLE_NEWS_RSS = (
+    "https://news.google.com/rss/search"
+    "?q=mercado+financeiro+bolsas+mundiais"
+    "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+)
 
 def noticias():
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {
-        "category": "business",
-        "language": "pt",
-        "pageSize": 5,
-        "apiKey": "939f315d880e41d7983dedb3ab0c98f1"
-    }
+    feed = feedparser.parse(GOOGLE_NEWS_RSS)
 
-    r = requests.get(url, params=params).json()
-    if "articles" not in r:
-        return ["Não foi possível buscar notícias hoje."]
+    if not feed.entries:
+        return []
 
-    return [f"📰 {a['title']}" for a in r["articles"]]
+    noticias = []
+    for entry in feed.entries[:8]:
+        titulo = entry.title
+        noticias.append(titulo)
+
+    return noticias
