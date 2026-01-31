@@ -20,7 +20,7 @@ bot = commands.Bot(
     help_command=None
 )
 
-# ───── ALERTAS ─────
+# ───── ESTADO ─────
 
 ALERTAS = []
 
@@ -44,43 +44,46 @@ async def on_ready():
 @bot.command()
 async def preco(ctx, ativo):
     try:
-        preco = market.preco_atual(ativo)
+        p = market.preco_atual(ativo)
         embed = discord.Embed(
             title="💰 Preço do ativo",
             description=f"**{ativo}**",
             color=0x3498db
         )
-        embed.add_field(name="Preço atual", value=f"{preco:.2f}", inline=False)
+        embed.add_field(name="Preço atual", value=f"{p:.2f}", inline=False)
         await ctx.send(embed=embed)
-    except:
+    except Exception as e:
         await ctx.send("❌ Não consegui encontrar esse ativo.")
+        print("Erro preco:", e)
 
 @bot.command()
 async def analise(ctx, ativo):
     try:
-        preco = market.preco_atual(ativo)
-        rsi = market.rsi(ativo)
-        tendencia = market.tendencia(ativo)
+        p = market.preco_atual(ativo)
+        r = market.rsi(ativo)
+        t = market.tendencia(ativo)
 
         embed = discord.Embed(
             title=f"📊 Análise — {ativo}",
             color=0x2ecc71
         )
-        embed.add_field(name="Preço", value=f"{preco:.2f}", inline=True)
-        embed.add_field(name="RSI", value=f"{rsi:.1f}", inline=True)
-        embed.add_field(name="Tendência", value=tendencia, inline=False)
+        embed.add_field(name="Preço", value=f"{p:.2f}", inline=True)
+        embed.add_field(name="RSI", value=f"{r:.1f}", inline=True)
+        embed.add_field(name="Tendência", value=t, inline=False)
 
         await ctx.send(embed=embed)
-    except:
+    except Exception as e:
         await ctx.send("❌ Erro ao analisar esse ativo.")
+        print("Erro analise:", e)
 
 @bot.command()
 async def tendencia(ctx, ativo):
     try:
-        tendencia = market.tendencia(ativo)
-        await ctx.send(f"📈 **{ativo}** → {tendencia}")
-    except:
+        t = market.tendencia(ativo)
+        await ctx.send(f"📈 **{ativo}** → {t}")
+    except Exception as e:
         await ctx.send("❌ Ativo inválido.")
+        print("Erro tendencia:", e)
 
 @bot.command()
 async def ativos(ctx):
@@ -114,7 +117,6 @@ async def ativos(ctx):
         )
 
     embed.set_footer(text=f"Total de ativos: {len(config.ATIVOS)}")
-
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -135,7 +137,7 @@ async def help(ctx):
     )
 
     embed.add_field(
-        name="👥 Comandos para todos",
+        name="👥 Comandos",
         value=(
             "!preco ATIVO\n"
             "!analise ATIVO\n"
@@ -147,15 +149,15 @@ async def help(ctx):
     )
 
     embed.add_field(
-        name="👑 Comandos admin",
+        name="👑 Admin",
         value=(
             "!setcanal\n"
             "!setcanalnoticias\n"
             "!add ATIVO\n"
             "!remove ATIVO\n"
             "!intervalo MIN\n"
-            "!news on\n"
-            "!news off"
+            "!news on/off\n"
+            "!testnoticias"
         ),
         inline=False
     )
@@ -175,7 +177,7 @@ async def setcanal(ctx):
 @commands.has_permissions(administrator=True)
 async def setcanalnoticias(ctx):
     config.CANAL_NOTICIAS = ctx.channel.id
-    await ctx.send("📰 Canal de notícias definido com sucesso.")
+    await ctx.send("📰 Canal de notícias definido.")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -183,8 +185,6 @@ async def add(ctx, ativo):
     if ativo not in config.ATIVOS:
         config.ATIVOS.append(ativo)
         await ctx.send(f"✅ {ativo} adicionado.")
-    else:
-        await ctx.send("⚠️ Esse ativo já está na lista.")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -192,8 +192,6 @@ async def remove(ctx, ativo):
     if ativo in config.ATIVOS:
         config.ATIVOS.remove(ativo)
         await ctx.send(f"🗑️ {ativo} removido.")
-    else:
-        await ctx.send("⚠️ Esse ativo não está na lista.")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -214,7 +212,24 @@ async def news_off(ctx):
     config.NEWS_ATIVAS = False
     await ctx.send("📰 Notícias desativadas.")
 
-# ───── TAREFAS AUTOMÁTICAS ─────
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testnoticias(ctx):
+    noticias = news.noticias()
+
+    if not noticias:
+        await ctx.send("❌ Nenhuma notícia retornada.")
+        return
+
+    embed = discord.Embed(
+        title="🧪 Teste — Jornal do Mercado",
+        description="\n".join(f"• {n}" for n in noticias[:5]),
+        color=0xE67E22
+    )
+
+    await ctx.send(embed=embed)
+
+# ───── TASKS ─────
 
 @tasks.loop(minutes=5)
 async def verificar_alertas():
@@ -247,19 +262,24 @@ async def analise_automatica():
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.loop(time=time(hour=18, minute=53, tzinfo=BR_TZ))
+@tasks.loop(time=time(hour=19, minute=02, tzinfo=BR_TZ))
 async def noticias_diarias():
+    print("📰 Executando noticias_diarias")
+
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
+        print("📰 Notícias desativadas ou canal não definido")
         return
 
     canal = bot.get_channel(config.CANAL_NOTICIAS)
     noticias = news.noticias()
 
+    print("📰 Notícias recebidas:", noticias)
+
     if not noticias:
         return
 
     embed = discord.Embed(
-        title="🗞️ Notícias do Mercado Global",
+        title="🗞️ Jornal do Mercado Global — Abertura",
         color=0xF39C12
     )
 
@@ -271,19 +291,23 @@ async def noticias_diarias():
 
     embed.add_field(
         name="📊 Leitura do Mercado",
-        value="Resumo automático com base no noticiário global.",
+        value="Resumo automático baseado no noticiário global.",
         inline=False
     )
 
     embed.add_field(
         name="🧠 Recomendação",
-        value="⏳ **Postura cautelosa**\n• Aguardar confirmações\n• Priorizar gestão de risco",
+        value="⏳ Postura cautelosa • Gestão de risco • Evitar impulsos",
         inline=False
     )
 
-    embed.set_footer(text="Atualizado automaticamente • 18:53")
-
+    embed.set_footer(text="Atualizado automaticamente • 19:02")
     await canal.send(embed=embed)
+
+@noticias_diarias.before_loop
+async def before_noticias():
+    await bot.wait_until_ready()
+    print("📰 Task de notícias pronta")
 
 # ───── START ─────
 
