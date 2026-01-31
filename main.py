@@ -248,7 +248,7 @@ async def analise_automatica():
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.loop(time=time(hour=6, minute=0, tzinfo=BR_TZ))
+@tasks.looptime(hour=15, minute=42, tzinfo=BR_TZ)
 async def noticias_diarias():
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
