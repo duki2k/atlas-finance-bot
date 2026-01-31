@@ -13,12 +13,11 @@ def noticias():
         if not feed.entries:
             return []
 
-        noticias = []
+        titulos = []
         for entry in feed.entries[:8]:
-            titulo = entry.title.strip()
-            noticias.append(titulo)
+            titulos.append(entry.title.strip())
 
-        return noticias
+        return titulos
 
     except Exception as e:
         print("Erro ao buscar notícias:", e)
