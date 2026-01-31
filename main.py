@@ -113,6 +113,12 @@ async def alerta(ctx, ativo, valor: float):
     })
     await ctx.send(f"🚨 Alerta criado para {ativo} em {valor}")
 
+@bot.command()
+async def pingnews(ctx):
+    noticias = news.noticias()
+    await ctx.send("TESTE NEWS OK:\n" + "\n".join(noticias))
+
+
 # ───── COMANDOS ADMIN ─────
 
 @bot.command()
