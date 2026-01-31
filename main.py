@@ -28,6 +28,44 @@ def sentimento_mercado(noticias):
     else:
         return "🟡 **Sentimento neutro** — mercado indefinido e seletivo."
 
+def montar_embed_jornal(noticias, horario_label):
+    sentimento = sentimento_mercado(noticias)
+
+    embed = discord.Embed(
+        title="🗞️ Jornal do Mercado Global",
+        description="Resumo das principais movimentações do mercado financeiro",
+        color=0xF1C40F
+    )
+
+    embed.add_field(
+        name="🌍 Destaques do dia",
+        value="\n".join(f"• {n}" for n in noticias[:5]),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Sentimento do mercado",
+        value=sentimento,
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧠 Leitura do Bot",
+        value=(
+            "• Evite decisões impulsivas\n"
+            "• Priorize gestão de risco\n"
+            "• Confirme tendências antes de entrar"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"Atualizado {horario_label} "
+    )
+
+    return embed
+
+
 
 # ───── TOKEN ─────
 
