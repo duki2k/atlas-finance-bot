@@ -146,6 +146,31 @@ async def news_off(ctx):
     config.NEWS_ATIVAS = False
     await ctx.send("📰 Notícias desativadas")
 
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def jornalagora(ctx):
+    if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
+        await ctx.send("❌ Notícias desativadas ou canal não definido.")
+        return
+
+    noticias = news.noticias()
+    if not noticias:
+        await ctx.send("❌ Nenhuma notícia retornada.")
+        return
+
+    embed = discord.Embed(
+        title="🗞️ Jornal do Mercado — TESTE MANUAL",
+        description="\n".join(f"• {n}" for n in noticias[:5]),
+        color=0xF39C12
+    )
+    embed.set_footer(text="Disparo manual para teste")
+
+    canal = bot.get_channel(config.CANAL_NOTICIAS)
+    await canal.send(embed=embed)
+
+    await ctx.send("✅ Jornal enviado manualmente.")
+
+
 # ───── TASKS ─────
 
 @tasks.loop(minutes=5)
