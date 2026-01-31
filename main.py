@@ -14,7 +14,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 
-# desativa o help padrão do discord
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
@@ -35,11 +34,10 @@ async def on_ready():
         analise_automatica.start()
 
     if not noticias_diarias.is_running():
-    noticias_diarias.start()
+        noticias_diarias.start()
 
     if not verificar_alertas.is_running():
         verificar_alertas.start()
-
 
 # ───── COMANDOS USUÁRIO ─────
 
@@ -152,6 +150,7 @@ async def help(ctx):
         name="👑 Comandos admin",
         value=(
             "!setcanal\n"
+            "!setcanalnoticias\n"
             "!add ATIVO\n"
             "!remove ATIVO\n"
             "!intervalo MIN\n"
@@ -162,22 +161,21 @@ async def help(ctx):
     )
 
     embed.set_footer(text="Atlas Community ® 2026")
-
     await ctx.send(embed=embed)
 
 # ───── COMANDOS ADMIN ─────
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setcanalnoticias(ctx):
-    config.CANAL_NOTICIAS = ctx.channel.id
-    await ctx.send("📰 Canal de notícias definido com sucesso.")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
 async def setcanal(ctx):
     config.CANAL_ANALISE = ctx.channel.id
     await ctx.send("✅ Canal de análises definido.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanalnoticias(ctx):
+    config.CANAL_NOTICIAS = ctx.channel.id
+    await ctx.send("📰 Canal de notícias definido com sucesso.")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -225,11 +223,10 @@ async def verificar_alertas():
             preco = market.preco_atual(alerta["ativo"])
             if preco >= alerta["valor"]:
                 canal = bot.get_channel(alerta["canal"])
-                mensagem = (
-                    "🚨 **ALERTA ATINGIDO**\n"
+                await canal.send(
+                    f"🚨 **ALERTA ATINGIDO**\n"
                     f"{alerta['ativo']} chegou a {preco:.2f}"
                 )
-                await canal.send(mensagem)
                 ALERTAS.remove(alerta)
         except:
             pass
@@ -246,11 +243,12 @@ async def analise_automatica():
         except:
             pass
 
+# ───── NOTÍCIAS FIXAS (TESTE 18:53) ─────
+
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.loop(time=time(hour=18, minute=45, tzinfo=BR_TZ))
+@tasks.loop(time=time(hour=18, minute=53, tzinfo=BR_TZ))
 async def noticias_diarias():
-
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
 
@@ -260,48 +258,8 @@ async def noticias_diarias():
     if not noticias:
         return
 
-    # ───── CLASSIFICAÇÃO SIMPLES DO MERCADO ─────
-    texto_completo = " ".join(noticias).lower()
-
-    palavras_negativas = ["queda", "cai", "recuo", "tensão", "crise", "volatilidade", "inflação"]
-    palavras_positivas = ["alta", "sobe", "ganho", "otimismo", "recuperação", "avanço"]
-
-    score = 0
-    for p in palavras_positivas:
-        if p in texto_completo:
-            score += 1
-    for p in palavras_negativas:
-        if p in texto_completo:
-            score -= 1
-
-    if score >= 2:
-        leitura = "🟢 Mercado com viés positivo"
-        recomendacao = (
-            "📈 **Postura construtiva**\n"
-            "• Buscar oportunidades com gestão de risco\n"
-            "• Priorizar ativos líquidos\n"
-            "• Evitar excesso de alavancagem"
-        )
-    elif score <= -2:
-        leitura = "🔴 Mercado defensivo"
-        recomendacao = (
-            "⚠️ **Postura defensiva**\n"
-            "• Preservar capital\n"
-            "• Evitar operações impulsivas\n"
-            "• Priorizar proteção e liquidez"
-        )
-    else:
-        leitura = "🟡 Mercado indefinido"
-        recomendacao = (
-            "⏳ **Postura cautelosa**\n"
-            "• Aguardar confirmação de tendência\n"
-            "• Operar com menor exposição\n"
-            "• Foco em gestão de risco"
-        )
-
-    # ───── EMBED JORNAL ─────
     embed = discord.Embed(
-        title="🗞️ Jornal do Mercado Global — Abertura",
+        title="🗞️ Notícias do Mercado Global",
         color=0xF39C12
     )
 
@@ -313,23 +271,19 @@ async def noticias_diarias():
 
     embed.add_field(
         name="📊 Leitura do Mercado",
-        value=leitura,
+        value="Resumo automático com base no noticiário global.",
         inline=False
     )
 
     embed.add_field(
         name="🧠 Recomendação",
-        value=recomendacao,
+        value="⏳ **Postura cautelosa**\n• Aguardar confirmações\n• Priorizar gestão de risco",
         inline=False
     )
 
-    embed.set_footer(
-        text="Atualizado às 06:00"
-    )
+    embed.set_footer(text="Atualizado automaticamente • 18:53")
 
     await canal.send(embed=embed)
-
-
 
 # ───── START ─────
 
