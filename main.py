@@ -4,79 +4,17 @@ from discord.ext import commands, tasks
 import config
 import market
 import news
+import requests
 from datetime import time, datetime
 import pytz
 
-def sentimento_mercado(noticias):
-    texto = " ".join(noticias).lower()
-
-    positivas = ["alta", "sobe", "ganho", "otimismo", "avanço", "recuperação"]
-    negativas = ["queda", "cai", "recuo", "crise", "tensão", "volatilidade", "inflação"]
-
-    score = 0
-    for p in positivas:
-        if p in texto:
-            score += 1
-    for n in negativas:
-        if n in texto:
-            score -= 1
-
-    if score >= 2:
-        return "🟢 **Sentimento positivo** — mercado com viés construtivo."
-    elif score <= -2:
-        return "🔴 **Sentimento defensivo** — cautela e proteção de capital."
-    else:
-        return "🟡 **Sentimento neutro** — mercado indefinido e seletivo."
-
-def montar_embed_jornal(noticias, horario_label):
-    sentimento = sentimento_mercado(noticias)
-
-    embed = discord.Embed(
-        title="🗞️ Jornal do Mercado Global",
-        description="Resumo das principais movimentações do mercado financeiro",
-        color=0xF1C40F
-    )
-
-    embed.add_field(
-        name="🌍 Destaques do dia",
-        value="\n".join(f"• {n}" for n in noticias[:5]),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Sentimento do mercado",
-        value=sentimento,
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧠 Leitura do Bot",
-        value=(
-            "• Evite decisões impulsivas\n"
-            "• Priorize gestão de risco\n"
-            "• Confirme tendências antes de entrar"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(
-        text=f"Atualizado {horario_label} "
-    )
-
-    return embed
-
-
-
-# ───── TOKEN ─────
+# ───── CONFIGURAÇÕES ─────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-
-# ───── INTENTS ─────
+BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 intents = discord.Intents.default()
 intents.message_content = True
-
-# ───── BOT ─────
 
 bot = commands.Bot(
     command_prefix="!",
@@ -84,96 +22,102 @@ bot = commands.Bot(
     help_command=None
 )
 
-# ───── ESTADO ─────
+# ───── MAPA DE ATIVOS ─────
 
-ALERTAS = []
+ATIVOS_INFO = {
+    "AAPL": ("Apple Inc.", "Ação EUA"),
+    "MSFT": ("Microsoft Corporation", "Ação EUA"),
+    "AMZN": ("Amazon.com Inc.", "Ação EUA"),
+    "GOOGL": ("Alphabet Inc.", "Ação EUA"),
+    "TSLA": ("Tesla Inc.", "Ação EUA"),
+    "NVDA": ("NVIDIA Corporation", "Ação EUA"),
+    "META": ("Meta Platforms Inc.", "Ação EUA"),
+    "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
+    "BTC-USD": ("Bitcoin", "Criptomoeda"),
+    "ETH-USD": ("Ethereum", "Criptomoeda"),
+    "ADA-USD": ("Cardano", "Criptomoeda"),
+    "XRP-USD": ("XRP", "Criptomoeda"),
+    "BNB-USD": ("Binance Coin", "Criptomoeda"),
+}
 
-# ───── EVENTO READY ─────
+# ───── UTILIDADES ─────
+
+def dolar_para_real():
+    try:
+        r = requests.get(
+            "https://api.exchangerate.host/latest?base=USD&symbols=BRL",
+            timeout=10
+        ).json()
+        return float(r["rates"]["BRL"])
+    except:
+        return 5.0
+
+def sentimento_mercado(noticias):
+    texto = " ".join(noticias).lower()
+    pos = ["alta","sobe","ganho","avanço","recuperação"]
+    neg = ["queda","cai","crise","tensão","volatilidade"]
+    score = sum(p in texto for p in pos) - sum(n in texto for n in neg)
+
+    if score >= 2:
+        return "🟢 Sentimento positivo — mercado construtivo"
+    elif score <= -2:
+        return "🔴 Sentimento defensivo — cautela recomendada"
+    return "🟡 Sentimento neutro — mercado indefinido"
+
+def embed_ativo(ativo, usd, brl):
+    nome, tipo = ATIVOS_INFO.get(ativo, (ativo, "Ativo Financeiro"))
+    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y às %H:%M")
+
+    embed = discord.Embed(
+        title=f"📊 {nome}",
+        description=f"**Ticker:** `{ativo}`\n**Tipo:** {tipo}",
+        color=0x2ECC71
+    )
+
+    embed.add_field(name="💲 USD", value=f"${usd:,.2f}", inline=True)
+    embed.add_field(name="🇧🇷 BRL", value=f"R$ {brl:,.2f}", inline=True)
+    embed.set_footer(text=f"Atualizado em {agora}")
+
+    return embed
+
+# ───── EVENTO ─────
 
 @bot.event
 async def on_ready():
     print(f"🤖 Conectado como {bot.user}")
+    analise_diaria.start()
+    noticias_diarias.start()
 
-    if not analise_automatica.is_running():
-        analise_automatica.start()
-
-    if not noticias_diarias.is_running():
-        noticias_diarias.start()
-
-    if not verificar_alertas.is_running():
-        verificar_alertas.start()
-
-# ───── COMANDOS ─────
+# ───── COMANDOS (ADMIN ONLY) ─────
 
 @bot.command()
+@commands.has_permissions(administrator=True)
 async def help(ctx):
     embed = discord.Embed(
-        title="🤖 Atlas Finance Bot",
-        description="Comandos disponíveis",
-        color=0x00ff99
+        title="🤖 Atlas Finance Bot — Painel Admin",
+        description="Bot automático de mercado financeiro",
+        color=0x3498DB
     )
+
     embed.add_field(
-        name="Usuários",
-        value=(
-            "!preco ATIVO\n"
-            "!analise ATIVO\n"
-            "!tendencia ATIVO\n"
-            "!ativos\n"
-            "!alerta ATIVO VALOR"
-        ),
+        name="📊 Automático",
+        value="• Relatório diário de ativos (06h)\n• Jornal do mercado (06h e 18h)",
         inline=False
     )
+
     embed.add_field(
-        name="Admin",
-        value=(
-            "!setcanal\n"
-            "!setcanalnoticias\n"
-            "!intervalo MIN\n"
-            "!news on/off"
-        ),
+        name="🧪 Testes",
+        value="`!testenoticias` — testar portal de notícias",
         inline=False
     )
+
+    embed.add_field(
+        name="⚙️ Configuração",
+        value="`!setcanal`\n`!setcanalnoticias`",
+        inline=False
+    )
+
     await ctx.send(embed=embed)
-
-@bot.command()
-async def preco(ctx, ativo):
-    try:
-        p = market.preco_atual(ativo)
-        await ctx.send(f"💰 **{ativo}** → {p:.2f}")
-    except:
-        await ctx.send("❌ Ativo não encontrado")
-
-@bot.command()
-async def analise(ctx, ativo):
-    try:
-        p = market.preco_atual(ativo)
-        t = market.tendencia(ativo)
-        await ctx.send(f"📊 **{ativo}**\nPreço: {p:.2f}\nTendência: {t}")
-    except:
-        await ctx.send("❌ Erro ao analisar")
-
-@bot.command()
-async def tendencia(ctx, ativo):
-    try:
-        t = market.tendencia(ativo)
-        await ctx.send(f"📈 **{ativo}** → {t}")
-    except:
-        await ctx.send("❌ Ativo inválido")
-
-@bot.command()
-async def ativos(ctx):
-    await ctx.send("📊 Ativos:\n" + ", ".join(config.ATIVOS))
-
-@bot.command()
-async def alerta(ctx, ativo, valor: float):
-    ALERTAS.append({
-        "ativo": ativo,
-        "valor": valor,
-        "canal": ctx.channel.id
-    })
-    await ctx.send(f"🚨 Alerta criado para {ativo} em {valor}")
-
-# ───── COMANDOS ADMIN ─────
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -189,66 +133,41 @@ async def setcanalnoticias(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def intervalo(ctx, minutos: int):
-    config.INTERVALO_MINUTOS = minutos
-    analise_automatica.change_interval(minutes=minutos)
-    await ctx.send(f"⏱️ Intervalo alterado para {minutos} min")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def news_on(ctx):
-    config.NEWS_ATIVAS = True
-    await ctx.send("📰 Notícias ativadas")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def news_off(ctx):
-    config.NEWS_ATIVAS = False
-    await ctx.send("📰 Notícias desativadas")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
 async def testenoticias(ctx):
     noticias = news.noticias()
-
     if not noticias:
-        await ctx.send("❌ Nenhuma notícia retornada.")
+        await ctx.send("❌ Nenhuma notícia retornada")
         return
 
-    embed = montar_embed_jornal(noticias, "manual")
+    embed = discord.Embed(
+        title="🧪 Teste de Notícias",
+        description="\n".join(f"• {n}" for n in noticias[:5]),
+        color=0xE67E22
+    )
     await ctx.send(embed=embed)
 
+# ───── TASK: ANÁLISE DIÁRIA ─────
 
-
-# ───── TASKS ─────
-
-@tasks.loop(minutes=5)
-async def verificar_alertas():
-    for alerta in ALERTAS[:]:
-        try:
-            p = market.preco_atual(alerta["ativo"])
-            if p >= alerta["valor"]:
-                canal = bot.get_channel(alerta["canal"])
-                await canal.send(f"🚨 {alerta['ativo']} atingiu {p:.2f}")
-                ALERTAS.remove(alerta)
-        except:
-            pass
-
-@tasks.loop(minutes=config.INTERVALO_MINUTOS)
-async def analise_automatica():
+@tasks.loop(time=time(hour=6, minute=0, tzinfo=BR_TZ))
+async def analise_diaria():
     if not config.CANAL_ANALISE:
         return
+
     canal = bot.get_channel(config.CANAL_ANALISE)
+    cotacao = dolar_para_real()
+
+    await canal.send("📈 **Relatório diário de ativos — 06:00**")
+
     for ativo in config.ATIVOS:
         try:
-            p = market.preco_atual(ativo)
-            await canal.send(f"📈 {ativo} → {p:.2f}")
+            usd = market.preco_atual(ativo)
+            brl = usd * cotacao
+            embed = embed_ativo(ativo, usd, brl)
+            await canal.send(embed=embed)
         except:
             pass
 
-# ───── NOTÍCIAS FIXAS ─────
-
-BR_TZ = pytz.timezone("America/Sao_Paulo")
+# ───── TASK: NOTÍCIAS ─────
 
 @tasks.loop(time=[
     time(hour=6, minute=0, tzinfo=BR_TZ),
@@ -260,19 +179,23 @@ async def noticias_diarias():
 
     canal = bot.get_channel(config.CANAL_NOTICIAS)
     noticias = news.noticias()
-
     if not noticias:
         return
 
-    hora = "às 06:00" if datetime.now(BR_TZ).hour < 12 else "às 18:00"
-    embed = montar_embed_jornal(noticias, hora)
+    embed = discord.Embed(
+        title="🗞️ Jornal do Mercado Global",
+        description="\n".join(f"• {n}" for n in noticias[:5]),
+        color=0xF1C40F
+    )
 
+    embed.add_field(
+        name="📊 Sentimento do mercado",
+        value=sentimento_mercado(noticias),
+        inline=False
+    )
+
+    embed.set_footer(text="Conteúdo educacional • Atlas Community")
     await canal.send(embed=embed)
-
-@noticias_diarias.before_loop
-async def before_noticias():
-    await bot.wait_until_ready()
-    print("📰 Jornal automático pronto (06h / 18h)")
 
 # ───── START ─────
 
