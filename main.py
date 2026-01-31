@@ -4,7 +4,7 @@ from discord.ext import commands, tasks
 import config
 import market
 import news
-from datetime import time
+from datetime import time, datetime
 import pytz
 
 def sentimento_mercado(noticias):
@@ -246,11 +246,14 @@ async def analise_automatica():
         except:
             pass
 
-# ───── NOTÍCIAS FIXAS (TESTE 19:06) ─────
+# ───── NOTÍCIAS FIXAS ─────
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.loop(time=time(hour=19, minute=6, tzinfo=BR_TZ))
+@tasks.loop(time=[
+    time(hour=6, minute=0, tzinfo=BR_TZ),
+    time(hour=18, minute=0, tzinfo=BR_TZ)
+])
 async def noticias_diarias():
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
@@ -261,13 +264,15 @@ async def noticias_diarias():
     if not noticias:
         return
 
-    embed = discord.Embed(
-        title="🗞️ Jornal do Mercado — Abertura",
-        description="\n".join(f"• {n}" for n in noticias[:5]),
-        color=0xF39C12
-    )
-    embed.set_footer(text="Atualizado automaticamente • 19:06")
+    hora = "às 06:00" if datetime.now(BR_TZ).hour < 12 else "às 18:00"
+    embed = montar_embed_jornal(noticias, hora)
+
     await canal.send(embed=embed)
+
+@noticias_diarias.before_loop
+async def before_noticias():
+    await bot.wait_until_ready()
+    print("📰 Jornal automático pronto (06h / 18h)")
 
 # ───── START ─────
 
