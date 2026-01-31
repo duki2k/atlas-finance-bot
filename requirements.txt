@@ -3,3 +3,4 @@ yfinance==0.2.36
 requests==2.31.0
 pandas==2.2.1
 pytz
+feedparser
