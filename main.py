@@ -7,6 +7,28 @@ import news
 from datetime import time
 import pytz
 
+def sentimento_mercado(noticias):
+    texto = " ".join(noticias).lower()
+
+    positivas = ["alta", "sobe", "ganho", "otimismo", "avanço", "recuperação"]
+    negativas = ["queda", "cai", "recuo", "crise", "tensão", "volatilidade", "inflação"]
+
+    score = 0
+    for p in positivas:
+        if p in texto:
+            score += 1
+    for n in negativas:
+        if n in texto:
+            score -= 1
+
+    if score >= 2:
+        return "🟢 **Sentimento positivo** — mercado com viés construtivo."
+    elif score <= -2:
+        return "🔴 **Sentimento defensivo** — cautela e proteção de capital."
+    else:
+        return "🟡 **Sentimento neutro** — mercado indefinido e seletivo."
+
+
 # ───── TOKEN ─────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
