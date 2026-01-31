@@ -173,12 +173,6 @@ async def alerta(ctx, ativo, valor: float):
     })
     await ctx.send(f"🚨 Alerta criado para {ativo} em {valor}")
 
-@bot.command()
-async def pingnews(ctx):
-    noticias = news.noticias()
-    await ctx.send("TESTE NEWS OK:\n" + "\n".join(noticias))
-
-
 # ───── COMANDOS ADMIN ─────
 
 @bot.command()
@@ -214,27 +208,16 @@ async def news_off(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def jornalagora(ctx):
-    if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
-        await ctx.send("❌ Notícias desativadas ou canal não definido.")
-        return
-
+async def testenoticias(ctx):
     noticias = news.noticias()
+
     if not noticias:
         await ctx.send("❌ Nenhuma notícia retornada.")
         return
 
-    embed = discord.Embed(
-        title="🗞️ Jornal do Mercado — TESTE MANUAL",
-        description="\n".join(f"• {n}" for n in noticias[:5]),
-        color=0xF39C12
-    )
-    embed.set_footer(text="Disparo manual para teste")
+    embed = montar_embed_jornal(noticias, "manual")
+    await ctx.send(embed=embed)
 
-    canal = bot.get_channel(config.CANAL_NOTICIAS)
-    await canal.send(embed=embed)
-
-    await ctx.send("✅ Jornal enviado manualmente.")
 
 
 # ───── TASKS ─────
