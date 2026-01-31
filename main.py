@@ -248,7 +248,7 @@ async def analise_automatica():
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.looptime(hour=15, minute=42, tzinfo=BR_TZ)
+@tasks.looptime(hour=18, minute=40, tzinfo=BR_TZ)
 async def noticias_diarias():
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
@@ -317,13 +317,13 @@ async def noticias_diarias():
     )
 
     embed.add_field(
-        name="🧠 Recomendação do Bot",
+        name="🧠 Recomendação",
         value=recomendacao,
         inline=False
     )
 
     embed.set_footer(
-        text="Atualizado às 06:00 • Conteúdo educacional • Não é recomendação financeira"
+        text="Atualizado às 06:00"
     )
 
     await canal.send(embed=embed)
