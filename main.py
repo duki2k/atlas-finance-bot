@@ -35,7 +35,7 @@ async def on_ready():
         analise_automatica.start()
 
     if not noticias_diarias.is_running():
-        noticias_diarias.start()
+    noticias_diarias.start()
 
     if not verificar_alertas.is_running():
         verificar_alertas.start()
@@ -248,7 +248,7 @@ async def analise_automatica():
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-@tasks.loop(time=time(hour=18, minute=40, tzinfo=BR_TZ))
+@tasks.loop(time=time(hour=18, minute=45, tzinfo=BR_TZ))
 async def noticias_diarias():
 
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
