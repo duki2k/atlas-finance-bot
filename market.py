@@ -8,6 +8,7 @@ import time
 CRYPTO_MAP = {
     "BTC-USD": "bitcoin",
     "ETH-USD": "ethereum",
+    "SOL-USD": "solana",
     "USDT-USD": "tether",
     "BNB-USD": "binancecoin",
     "XRP-USD": "ripple",
