@@ -125,7 +125,7 @@ def embed_relatorio_geral(dados, cotacao):
             inline=False
         )
 
-    embed.set_footer(text=f"Atualizado em {agora} • Atlas Finance Bot")
+    embed.set_footer(text=f"Atlas Community ® 2026 • Atualizado em {agora}")
     return embed
 
 # ─────────────────────────────
@@ -165,7 +165,7 @@ def embed_jornal(noticias):
         inline=False
     )
 
-    embed.set_footer(text="Conteúdo educacional • Atualização automática")
+    embed.set_footer(text="Atlas Community ® 2026")
     return embed
 
 # ─────────────────────────────
