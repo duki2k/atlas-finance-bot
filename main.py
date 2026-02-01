@@ -25,10 +25,11 @@ bot = commands.Bot(
 )
 
 # ─────────────────────────────
-# MAPA DE ATIVOS
+# MAPA DE ATIVOS (NOME COMPLETO + TIPO)
 # ─────────────────────────────
 
 ATIVOS_INFO = {
+    # Ações
     "AAPL": ("Apple Inc.", "Ação EUA"),
     "MSFT": ("Microsoft Corporation", "Ação EUA"),
     "AMZN": ("Amazon.com Inc.", "Ação EUA"),
@@ -37,8 +38,14 @@ ATIVOS_INFO = {
     "NVDA": ("NVIDIA Corporation", "Ação EUA"),
     "META": ("Meta Platforms Inc.", "Ação EUA"),
     "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
+    "JPM": ("JPMorgan Chase & Co.", "Ação EUA"),
+    "V": ("Visa Inc.", "Ação EUA"),
+    "MA": ("Mastercard Inc.", "Ação EUA"),
+
+    # Criptomoedas
     "BTC-USD": ("Bitcoin", "Criptomoeda"),
     "ETH-USD": ("Ethereum", "Criptomoeda"),
+    "SOL-USD": ("Solana", "Criptomoeda"),
     "ADA-USD": ("Cardano", "Criptomoeda"),
     "XRP-USD": ("XRP", "Criptomoeda"),
     "BNB-USD": ("Binance Coin", "Criptomoeda"),
@@ -59,33 +66,106 @@ def dolar_para_real():
         ).json()
         return float(r["rates"]["BRL"])
     except:
-        return 5.0
+        return 5.0  # fallback seguro
 
 def sentimento_mercado(noticias):
     texto = " ".join(noticias).lower()
-    positivas = ["alta", "sobe", "ganho", "avanço", "recuperação"]
-    negativas = ["queda", "cai", "crise", "volatilidade", "tensão"]
+    positivas = ["alta", "sobe", "ganho", "avanço", "recuperação", "otimismo"]
+    negativas = ["queda", "cai", "crise", "tensão", "volatilidade", "inflação"]
 
     score = sum(p in texto for p in positivas) - sum(n in texto for n in negativas)
 
     if score >= 2:
-        return "🟢 Sentimento positivo"
+        return "🟢 **Positivo** — mercado com viés construtivo"
     elif score <= -2:
-        return "🔴 Sentimento defensivo"
-    return "🟡 Sentimento neutro"
+        return "🔴 **Defensivo** — cautela e proteção de capital"
+    return "🟡 **Neutro** — mercado indefinido"
 
-def embed_ativo(ativo, usd, brl):
-    nome, tipo = ATIVOS_INFO.get(ativo, (ativo, "Ativo Financeiro"))
-    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+# ─────────────────────────────
+# EMBED ÚNICO — RELATÓRIO DE ATIVOS
+# ─────────────────────────────
+
+def embed_relatorio_geral(dados, cotacao):
+    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y às %H:%M")
 
     embed = discord.Embed(
-        title=f"📊 {nome}",
-        description=f"**Ticker:** `{ativo}`\n**Tipo:** {tipo}",
-        color=0x2ECC71
+        title="📊 Relatório Diário de Ativos",
+        description="Panorama consolidado dos principais ativos do mercado",
+        color=0x1ABC9C
     )
-    embed.add_field(name="💲 USD", value=f"${usd:,.2f}", inline=True)
-    embed.add_field(name="🇧🇷 BRL", value=f"R$ {brl:,.2f}", inline=True)
-    embed.set_footer(text=f"Atualizado em {agora}")
+
+    acoes = []
+    criptos = []
+
+    for ativo, preco_usd in dados.items():
+        preco_brl = preco_usd * cotacao
+        nome, tipo = ATIVOS_INFO.get(ativo, (ativo, "Ativo Financeiro"))
+
+        linha = (
+            f"**{nome}** (`{ativo}`)\n"
+            f"💲 ${preco_usd:,.2f}  |  🇧🇷 R$ {preco_brl:,.2f}"
+        )
+
+        if ativo.endswith("-USD"):
+            criptos.append(linha)
+        else:
+            acoes.append(linha)
+
+    if acoes:
+        embed.add_field(
+            name="📈 Ações",
+            value="\n\n".join(acoes),
+            inline=False
+        )
+
+    if criptos:
+        embed.add_field(
+            name="🪙 Criptomoedas",
+            value="\n\n".join(criptos),
+            inline=False
+        )
+
+    embed.set_footer(text=f"Atualizado em {agora} • Atlas Finance Bot")
+    return embed
+
+# ─────────────────────────────
+# EMBED — JORNAL DO MERCADO (VISUAL MELHORADO)
+# ─────────────────────────────
+
+def embed_jornal(noticias):
+    embed = discord.Embed(
+        title="🗞️ Jornal do Mercado Global",
+        description="Resumo das principais notícias econômicas e financeiras",
+        color=0xF39C12
+    )
+
+    noticias_formatadas = []
+    for i, n in enumerate(noticias[:6], start=1):
+        noticias_formatadas.append(f"**{i}.** {n}")
+
+    embed.add_field(
+        name="🌍 Destaques do Dia",
+        value="\n\n".join(noticias_formatadas),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Sentimento do Mercado",
+        value=sentimento_mercado(noticias),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧠 Leitura do Bot",
+        value=(
+            "• Evite decisões impulsivas\n"
+            "• Priorize gestão de risco\n"
+            "• Confirme tendências antes de operar"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Conteúdo educacional • Atualização automática")
     return embed
 
 # ─────────────────────────────
@@ -122,22 +202,13 @@ async def help(ctx):
 
     embed.add_field(
         name="⚙️ Configuração",
-        value=(
-            "`!setcanal`\n"
-            "`!setcanalnoticias`\n"
-            "`!setcanaladmin`"
-        ),
+        value="`!setcanal`\n`!setcanalnoticias`\n`!setcanaladmin`",
         inline=False
     )
 
     embed.add_field(
-        name="🧪 Testes",
-        value=(
-            "`!testenoticias`\n"
-            "`!testarpublicacoes`\n"
-            "`!statusbot`\n"
-            "`!manutencao`"
-        ),
+        name="🧪 Testes / Status",
+        value="`!testenoticias`\n`!testarpublicacoes`\n`!statusbot`",
         inline=False
     )
 
@@ -182,12 +253,7 @@ async def testenoticias(ctx):
         await ctx.send("❌ Nenhuma notícia retornada")
         return
 
-    embed = discord.Embed(
-        title="🧪 Teste de Notícias",
-        description="\n".join(f"• {n}" for n in noticias[:5]),
-        color=0xE67E22
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed_jornal(noticias))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -214,56 +280,35 @@ async def statusbot(ctx):
     embed.add_field(name="Notícias", value="Ativas" if config.NEWS_ATIVAS else "Off", inline=True)
     await ctx.send(embed=embed)
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def manutencao(ctx):
-    if not admin_channel_only(ctx):
-        return
-
-    try:
-        market.preco_atual("BTC-USD")
-        status_api = "OK"
-    except:
-        status_api = "FALHA"
-
-    embed = discord.Embed(title="🛠️ Manutenção", color=0xE67E22)
-    embed.add_field(name="API de preços", value=status_api, inline=False)
-    embed.add_field(name="Canal Análises", value="OK" if config.CANAL_ANALISE else "❌", inline=True)
-    embed.add_field(name="Canal Notícias", value="OK" if config.CANAL_NOTICIAS else "❌", inline=True)
-    embed.add_field(name="Canal Admin", value="OK" if config.CANAL_ADMIN else "❌", inline=True)
-    await ctx.send(embed=embed)
-
 # ─────────────────────────────
 # TASKS AUTOMÁTICAS
 # ─────────────────────────────
 
 @tasks.loop(time=time(hour=6, minute=0, tzinfo=BR_TZ))
 async def analise_diaria():
-    print("📊 Executando analise_diaria")
-
     if not config.CANAL_ANALISE:
         return
 
     canal = bot.get_channel(config.CANAL_ANALISE)
     cotacao = dolar_para_real()
 
-    await canal.send("📈 **Relatório diário de ativos — 06:00**")
-
+    dados = {}
     for ativo in config.ATIVOS:
         try:
-            usd = market.preco_atual(ativo)
-            brl = usd * cotacao
-            await canal.send(embed=embed_ativo(ativo, usd, brl))
+            dados[ativo] = market.preco_atual(ativo)
         except:
             pass
+
+    if not dados:
+        return
+
+    await canal.send(embed=embed_relatorio_geral(dados, cotacao))
 
 @tasks.loop(time=[
     time(hour=6, minute=0, tzinfo=BR_TZ),
     time(hour=18, minute=0, tzinfo=BR_TZ)
 ])
 async def noticias_diarias():
-    print("📰 Executando noticias_diarias")
-
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
 
@@ -272,30 +317,12 @@ async def noticias_diarias():
     if not noticias:
         return
 
-    embed = discord.Embed(
-        title="🗞️ Jornal do Mercado Global",
-        description="\n".join(f"• {n}" for n in noticias[:5]),
-        color=0xF1C40F
-    )
-
-    embed.add_field(
-        name="📊 Sentimento do mercado",
-        value=sentimento_mercado(noticias),
-        inline=False
-    )
-
-    embed.set_footer(text="Atlas Community • Conteúdo educacional")
-    await canal.send(embed=embed)
+    await canal.send(embed=embed_jornal(noticias))
 
 @tasks.loop(time=time(hour=18, minute=0, tzinfo=BR_TZ))
 async def resumo_semanal():
-    print("📅 Executando resumo_semanal")
-
     hoje = datetime.now(BR_TZ)
-    if hoje.weekday() != 4:
-        return
-
-    if not config.CANAL_NOTICIAS:
+    if hoje.weekday() != 4 or not config.CANAL_NOTICIAS:
         return
 
     canal = bot.get_channel(config.CANAL_NOTICIAS)
@@ -308,21 +335,13 @@ async def resumo_semanal():
 
     embed.add_field(
         name="📊 Visão Geral",
-        value=(
-            "• Semana marcada por volatilidade\n"
-            "• Atenção a dados macroeconômicos\n"
-            "• Fluxo seletivo para ativos de risco"
-        ),
+        value="• Semana marcada por volatilidade\n• Atenção a dados macroeconômicos",
         inline=False
     )
 
     embed.add_field(
         name="🧠 Leitura do Bot",
-        value=(
-            "• Avaliar posições\n"
-            "• Reduzir exposição excessiva\n"
-            "• Planejar próxima semana"
-        ),
+        value="• Avaliar posições\n• Planejar próxima semana com cautela",
         inline=False
     )
 
@@ -335,17 +354,14 @@ async def resumo_semanal():
 @analise_diaria.before_loop
 async def before_analise():
     await bot.wait_until_ready()
-    print("📊 analise_diaria pronta")
 
 @noticias_diarias.before_loop
 async def before_noticias():
     await bot.wait_until_ready()
-    print("📰 noticias_diarias pronta")
 
 @resumo_semanal.before_loop
 async def before_resumo():
     await bot.wait_until_ready()
-    print("📅 resumo_semanal pronta")
 
 # ─────────────────────────────
 # START
