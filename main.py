@@ -165,7 +165,7 @@ def embed_jornal(noticias):
         inline=False
     )
 
-    embed.set_footer(text="Atlas Community ® 2026")
+    embed.set_footer(text=f"Atlas Community ® 2026 • Atualizado em {agora}")
     return embed
 
 # ─────────────────────────────
