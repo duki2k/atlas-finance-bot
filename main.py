@@ -81,18 +81,17 @@ def calcular_variacao(ativo, preco_atual):
         return variacao, f"🔼 +{variacao:.2f}%"
     elif variacao < 0:
         return variacao, f"🔽 {variacao:.2f}%"
-    else:
-        return 0.0, "⏺️ 0.00%"
+    return 0.0, "⏺️ 0.00%"
 
 def cor_dinamica(variacoes):
     altas = len([v for v in variacoes if v > 0])
     baixas = len([v for v in variacoes if v < 0])
 
     if altas > baixas:
-        return 0x2ECC71  # verde
+        return 0x2ECC71
     elif baixas > altas:
-        return 0xE74C3C  # vermelho
-    return 0xF1C40F      # amarelo
+        return 0xE74C3C
+    return 0xF1C40F
 
 def sentimento_mercado(noticias):
     texto = " ".join(noticias).lower()
@@ -128,32 +127,27 @@ async def log_bot(titulo, mensagem, tipo="INFO"):
         color=cores.get(tipo, 0x95A5A6)
     )
 
-    embed.set_footer(
-        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    )
-
+    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
 
 # ─────────────────────────────
-# EMBED RELATÓRIO (COR DINÂMICA)
+# EMBEDS
 # ─────────────────────────────
 
 def embed_relatorio(dados, cotacao):
     agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-
-    acoes = []
-    criptos = []
     variacoes = []
+    acoes, criptos = [], []
 
     for ativo, preco in dados.items():
         nome, _ = ATIVOS_INFO.get(ativo, (ativo, ""))
-        variacao_num, variacao_txt = calcular_variacao(ativo, preco)
-        variacoes.append(variacao_num)
+        v_num, v_txt = calcular_variacao(ativo, preco)
+        variacoes.append(v_num)
 
         linha = (
             f"**{nome}** (`{ativo}`)\n"
             f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}\n"
-            f"📉 Variação: {variacao_txt}"
+            f"📉 Variação: {v_txt}"
         )
 
         if ativo.endswith("-USD"):
@@ -168,25 +162,12 @@ def embed_relatorio(dados, cotacao):
     )
 
     if acoes:
-        embed.add_field(
-            name="📈 Ações",
-            value="\n\n".join(acoes),
-            inline=False
-        )
-
+        embed.add_field(name="📈 Ações", value="\n\n".join(acoes), inline=False)
     if criptos:
-        embed.add_field(
-            name="🪙 Criptomoedas",
-            value="\n\n".join(criptos),
-            inline=False
-        )
+        embed.add_field(name="🪙 Criptomoedas", value="\n\n".join(criptos), inline=False)
 
-    embed.set_footer(text=f"Atlas Comunnity • Atualizado em {agora}")
+    embed.set_footer(text=f"Atualizado em {agora}")
     return embed
-
-# ─────────────────────────────
-# EMBED JORNAL (VISUAL MELHORADO)
-# ─────────────────────────────
 
 def embed_jornal(noticias):
     embed = discord.Embed(
@@ -195,29 +176,15 @@ def embed_jornal(noticias):
         color=0x3498DB
     )
 
-    destaques = []
-    for i, n in enumerate(noticias[:6], start=1):
-        destaques.append(f"**{i}.** {n}")
-
     embed.add_field(
         name="🌍 Destaques do Dia",
-        value="\n\n".join(destaques),
+        value="\n\n".join(f"• {n}" for n in noticias[:6]),
         inline=False
     )
 
     embed.add_field(
         name="📊 Sentimento do Mercado",
         value=sentimento_mercado(noticias),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧠 Leitura do Bot",
-        value=(
-            "• Priorize gestão de risco\n"
-            "• Evite decisões impulsivas\n"
-            "• Confirme tendências antes de operar"
-        ),
         inline=False
     )
 
@@ -234,6 +201,101 @@ async def on_ready():
     scheduler.start()
 
 # ─────────────────────────────
+# COMANDOS ADMIN
+# ─────────────────────────────
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def help(ctx):
+    if not admin_channel_only(ctx):
+        return
+
+    embed = discord.Embed(
+        title="🤖 Atlas Finance Bot — Admin",
+        color=0x3498DB
+    )
+
+    embed.add_field(
+        name="⚙️ Configuração",
+        value=(
+            "`!setcanaladmin`\n"
+            "`!setcanal`\n"
+            "`!setcanalnoticias`\n"
+            "`!setcanallogs`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧪 Testes",
+        value=(
+            "`!testenoticias`\n"
+            "`!testarpublicacoes`\n"
+            "`!statusbot`\n"
+            "`!manutencao`"
+        ),
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanaladmin(ctx):
+    config.CANAL_ADMIN = ctx.channel.id
+    await ctx.send("🔒 Canal admin definido")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanal(ctx):
+    config.CANAL_ANALISE = ctx.channel.id
+    await ctx.send("📊 Canal de análises definido")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanalnoticias(ctx):
+    config.CANAL_NOTICIAS = ctx.channel.id
+    await ctx.send("📰 Canal de notícias definido")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanallogs(ctx):
+    config.CANAL_LOGS = ctx.channel.id
+    await ctx.send("📋 Canal de logs definido")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testenoticias(ctx):
+    if not admin_channel_only(ctx):
+        return
+    noticias = news.noticias()
+    await ctx.send(embed=embed_jornal(noticias))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testarpublicacoes(ctx):
+    if not admin_channel_only(ctx):
+        return
+    await scheduler()
+    await ctx.send("✅ Publicações disparadas")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def statusbot(ctx):
+    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    await ctx.send(f"🤖 Bot online • {agora}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def manutencao(ctx):
+    try:
+        market.preco_atual("BTC-USD")
+        status = "OK"
+    except:
+        status = "FALHA"
+    await ctx.send(f"🛠️ API de preços: **{status}**")
+
+# ─────────────────────────────
 # SCHEDULER CONFIÁVEL (1 MIN)
 # ─────────────────────────────
 
@@ -244,7 +306,7 @@ async def scheduler():
     agora = datetime.now(BR_TZ)
     hora = agora.strftime("%H:%M")
 
-    # ───── RELATÓRIO 06:00 ─────
+    # RELATÓRIO 06:00
     if hora == "06:00" and ultimo_analise != agora.date():
         dados = {}
         cotacao = dolar_para_real()
@@ -252,19 +314,15 @@ async def scheduler():
         for ativo in config.ATIVOS:
             try:
                 dados[ativo] = market.preco_atual(ativo)
-            except Exception as e:
-                await log_bot(
-                    "Validação de ativo",
-                    f"Falha ao buscar `{ativo}`",
-                    tipo="AVISO"
-                )
+            except:
+                await log_bot("Validação de ativo", ativo, "AVISO")
 
         if dados and config.CANAL_ANALISE:
             canal = bot.get_channel(config.CANAL_ANALISE)
             await canal.send(embed=embed_relatorio(dados, cotacao))
             ultimo_analise = agora.date()
 
-    # ───── JORNAL 06:00 ─────
+    # JORNAL 06:00
     if hora == "06:00" and ultimo_jornal_manha != agora.date():
         noticias = news.noticias()
         if noticias and config.CANAL_NOTICIAS:
@@ -272,7 +330,7 @@ async def scheduler():
             await canal.send(embed=embed_jornal(noticias))
             ultimo_jornal_manha = agora.date()
 
-    # ───── JORNAL 18:00 ─────
+    # JORNAL 18:00
     if hora == "18:00" and ultimo_jornal_tarde != agora.date():
         noticias = news.noticias()
         if noticias and config.CANAL_NOTICIAS:
