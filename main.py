@@ -72,7 +72,7 @@ def calcular_variacao(ativo, preco_atual):
     anterior = ULTIMOS_PRECOS.get(ativo)
     ULTIMOS_PRECOS[ativo] = preco_atual
 
-    if not anterior:
+    if not anterior or anterior == 0:
         return 0.0, "⏺️ 0.00%"
 
     variacao = ((preco_atual - anterior) / anterior) * 100
@@ -127,7 +127,10 @@ async def log_bot(titulo, mensagem, tipo="INFO"):
         color=cores.get(tipo, 0x95A5A6)
     )
 
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
+    embed.set_footer(
+        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    )
+
     await canal.send(embed=embed)
 
 # ─────────────────────────────
@@ -188,8 +191,66 @@ def embed_jornal(noticias):
         inline=False
     )
 
-    embed.set_footer(text="Atlas Community • Atualização automática")
+    embed.set_footer(text="Atlas Finance Bot • Atualização automática")
     return embed
+
+# ─────────────────────────────
+# ENVIO DIRETO (USADO POR TESTE E SCHEDULER)
+# ─────────────────────────────
+
+async def enviar_relatorio_agora():
+    dados = {}
+    cotacao = dolar_para_real()
+
+    for ativo in config.ATIVOS:
+        try:
+            preco = market.preco_atual(ativo)
+            if preco is None or preco == 0:
+                await log_bot(
+                    "Validação de ativo",
+                    f"Preço inválido para `{ativo}`",
+                    tipo="AVISO"
+                )
+                continue
+
+            dados[ativo] = preco
+
+        except Exception as e:
+            await log_bot(
+                "Validação de ativo",
+                f"Falha ao buscar `{ativo}`\n{str(e)}",
+                tipo="AVISO"
+            )
+
+    if not dados:
+        await log_bot(
+            "Relatório diário",
+            "Nenhum ativo válido encontrado.",
+            tipo="ERRO"
+        )
+        return
+
+    if config.CANAL_ANALISE:
+        canal = bot.get_channel(config.CANAL_ANALISE)
+        if canal:
+            await canal.send(embed=embed_relatorio(dados, cotacao))
+
+
+async def enviar_jornal_agora():
+    noticias = news.noticias()
+
+    if not noticias:
+        await log_bot(
+            "Jornal",
+            "Nenhuma notícia retornada.",
+            tipo="AVISO"
+        )
+        return
+
+    if config.CANAL_NOTICIAS:
+        canal = bot.get_channel(config.CANAL_NOTICIAS)
+        if canal:
+            await canal.send(embed=embed_jornal(noticias))
 
 # ─────────────────────────────
 # EVENTO READY
@@ -217,23 +278,13 @@ async def help(ctx):
 
     embed.add_field(
         name="⚙️ Configuração",
-        value=(
-            "`!setcanaladmin`\n"
-            "`!setcanal`\n"
-            "`!setcanalnoticias`\n"
-            "`!setcanallogs`"
-        ),
+        value="`!setcanaladmin`\n`!setcanal`\n`!setcanalnoticias`\n`!setcanallogs`",
         inline=False
     )
 
     embed.add_field(
         name="🧪 Testes",
-        value=(
-            "`!testenoticias`\n"
-            "`!testarpublicacoes`\n"
-            "`!statusbot`\n"
-            "`!manutencao`"
-        ),
+        value="`!testenoticias`\n`!testarpublicacoes`\n`!statusbot`\n`!manutencao`",
         inline=False
     )
 
@@ -268,30 +319,18 @@ async def setcanallogs(ctx):
 async def testenoticias(ctx):
     if not admin_channel_only(ctx):
         return
-    noticias = news.noticias()
-    await ctx.send(embed=embed_jornal(noticias))
+    await enviar_jornal_agora()
+    await ctx.send("📰 Jornal enviado para teste")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def testarpublicacoes(ctx):
     if not admin_channel_only(ctx):
         return
-
     await ctx.send("🧪 Enviando publicações manualmente...")
-
-    await enviar_relatorio_agora(for ativo in config.ATIVOS:
-    try:
-        dados[ativo] = market.preco_atual(ativo)
-    except Exception as e:
-        await log_bot(
-            "Validação de ativo",
-            f"Ativo `{ativo}` ignorado.\nMotivo: {str(e)}",
-            tipo="AVISO"
-        )
+    await enviar_relatorio_agora()
     await enviar_jornal_agora()
-
-    await ctx.send("✅ Relatório e jornal enviados com sucesso.")
-
+    await ctx.send("✅ Publicações enviadas")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -313,45 +352,6 @@ async def manutencao(ctx):
 # SCHEDULER CONFIÁVEL (1 MIN)
 # ─────────────────────────────
 
-async def enviar_relatorio_agora():
-    dados = {}
-    cotacao = dolar_para_real()
-
-    for ativo in config.ATIVOS:
-        try:
-            dados[ativo] = market.preco_atual(ativo)
-        except:
-            await log_bot(
-                "Validação de ativo",
-                f"Falha ao buscar `{ativo}`",
-                tipo="AVISO"
-            )
-
-    if not dados:
-        return
-
-    if config.CANAL_ANALISE:
-        canal = bot.get_channel(config.CANAL_ANALISE)
-        if canal:
-            await canal.send(embed=embed_relatorio(dados, cotacao))
-
-
-async def enviar_jornal_agora():
-    noticias = news.noticias()
-
-    if not noticias:
-        await log_bot(
-            "Jornal",
-            "Nenhuma notícia retornada no envio manual",
-            tipo="AVISO"
-        )
-        return
-
-    if config.CANAL_NOTICIAS:
-        canal = bot.get_channel(config.CANAL_NOTICIAS)
-        if canal:
-            await canal.send(embed=embed_jornal(noticias))
-
 @tasks.loop(minutes=1)
 async def scheduler():
     global ultimo_analise, ultimo_jornal_manha, ultimo_jornal_tarde
@@ -361,35 +361,18 @@ async def scheduler():
 
     # RELATÓRIO 06:00
     if hora == "06:00" and ultimo_analise != agora.date():
-        dados = {}
-        cotacao = dolar_para_real()
-
-        for ativo in config.ATIVOS:
-            try:
-                dados[ativo] = market.preco_atual(ativo)
-            except:
-                await log_bot("Validação de ativo", ativo, "AVISO")
-
-        if dados and config.CANAL_ANALISE:
-            canal = bot.get_channel(config.CANAL_ANALISE)
-            await canal.send(embed=embed_relatorio(dados, cotacao))
-            ultimo_analise = agora.date()
+        await enviar_relatorio_agora()
+        ultimo_analise = agora.date()
 
     # JORNAL 06:00
     if hora == "06:00" and ultimo_jornal_manha != agora.date():
-        noticias = news.noticias()
-        if noticias and config.CANAL_NOTICIAS:
-            canal = bot.get_channel(config.CANAL_NOTICIAS)
-            await canal.send(embed=embed_jornal(noticias))
-            ultimo_jornal_manha = agora.date()
+        await enviar_jornal_agora()
+        ultimo_jornal_manha = agora.date()
 
     # JORNAL 18:00
     if hora == "18:00" and ultimo_jornal_tarde != agora.date():
-        noticias = news.noticias()
-        if noticias and config.CANAL_NOTICIAS:
-            canal = bot.get_channel(config.CANAL_NOTICIAS)
-            await canal.send(embed=embed_jornal(noticias))
-            ultimo_jornal_tarde = agora.date()
+        await enviar_jornal_agora()
+        ultimo_jornal_tarde = agora.date()
 
 # ─────────────────────────────
 # START
