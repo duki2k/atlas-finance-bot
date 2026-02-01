@@ -7,9 +7,10 @@ import news
 import requests
 from datetime import datetime
 import pytz
+import asyncio
 
 # ─────────────────────────────
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES BÁSICAS
 # ─────────────────────────────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,14 +19,10 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None
-)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ─────────────────────────────
-# CONTROLE DE DISPARO
+# ESTADO GLOBAL
 # ─────────────────────────────
 
 ultimo_analise = None
@@ -33,19 +30,24 @@ ultimo_jornal_manha = None
 ultimo_jornal_tarde = None
 
 ULTIMOS_PRECOS = {}
+FALHAS_ATIVOS = {}
 
 # ─────────────────────────────
 # MAPA DE ATIVOS
 # ─────────────────────────────
 
 ATIVOS_INFO = {
+    # Ações
     "AAPL": ("Apple Inc.", "Ação EUA"),
     "MSFT": ("Microsoft Corporation", "Ação EUA"),
     "AMZN": ("Amazon.com Inc.", "Ação EUA"),
-    "GOOGL": ("Alphabet Inc. (Google)", "Ação EUA"),
+    "GOOGL": ("Alphabet Inc.", "Ação EUA"),
     "TSLA": ("Tesla Inc.", "Ação EUA"),
     "NVDA": ("NVIDIA Corporation", "Ação EUA"),
     "META": ("Meta Platforms Inc.", "Ação EUA"),
+    "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
+
+    # Criptomoedas
     "BTC-USD": ("Bitcoin", "Criptomoeda"),
     "ETH-USD": ("Ethereum", "Criptomoeda"),
     "SOL-USD": ("Solana", "Criptomoeda"),
@@ -54,9 +56,6 @@ ATIVOS_INFO = {
 # ─────────────────────────────
 # FUNÇÕES AUXILIARES
 # ─────────────────────────────
-
-def admin_channel_only(ctx):
-    return config.CANAL_ADMIN and ctx.channel.id == config.CANAL_ADMIN
 
 def dolar_para_real():
     try:
@@ -67,6 +66,7 @@ def dolar_para_real():
         return float(r["rates"]["BRL"])
     except:
         return 5.0
+
 
 def calcular_variacao(ativo, preco_atual):
     anterior = ULTIMOS_PRECOS.get(ativo)
@@ -83,9 +83,10 @@ def calcular_variacao(ativo, preco_atual):
         return variacao, f"🔽 {variacao:.2f}%"
     return 0.0, "⏺️ 0.00%"
 
+
 def cor_dinamica(variacoes):
-    altas = len([v for v in variacoes if v > 0])
-    baixas = len([v for v in variacoes if v < 0])
+    altas = sum(1 for v in variacoes if v > 0)
+    baixas = sum(1 for v in variacoes if v < 0)
 
     if altas > baixas:
         return 0x2ECC71
@@ -93,18 +94,6 @@ def cor_dinamica(variacoes):
         return 0xE74C3C
     return 0xF1C40F
 
-def sentimento_mercado(noticias):
-    texto = " ".join(noticias).lower()
-    pos = ["alta", "sobe", "ganho", "avanço", "recuperação"]
-    neg = ["queda", "cai", "crise", "tensão", "volatilidade"]
-
-    score = sum(p in texto for p in pos) - sum(n in texto for n in neg)
-
-    if score >= 2:
-        return "🟢 Positivo"
-    elif score <= -2:
-        return "🔴 Defensivo"
-    return "🟡 Neutro"
 
 async def log_bot(titulo, mensagem, tipo="INFO"):
     if not config.CANAL_LOGS:
@@ -116,9 +105,9 @@ async def log_bot(titulo, mensagem, tipo="INFO"):
 
     cores = {
         "INFO": 0x3498DB,
-        "SUCESSO": 0x2ECC71,
         "AVISO": 0xF1C40F,
-        "ERRO": 0xE74C3C
+        "ERRO": 0xE74C3C,
+        "SUCESSO": 0x2ECC71
     }
 
     embed = discord.Embed(
@@ -127,11 +116,43 @@ async def log_bot(titulo, mensagem, tipo="INFO"):
         color=cores.get(tipo, 0x95A5A6)
     )
 
-    embed.set_footer(
-        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    )
-
+    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
+
+# ─────────────────────────────
+# FALLBACK DE PREÇO (AÇÕES + CRIPTOS)
+# ─────────────────────────────
+
+async def buscar_preco_com_fallback(ativo):
+    # 1️⃣ tentativa padrão
+    try:
+        preco = market.preco_atual(ativo)
+        if preco and preco > 0:
+            return preco
+    except:
+        pass
+
+    # 2️⃣ retry simples
+    await asyncio.sleep(1)
+    try:
+        preco = market.preco_atual(ativo)
+        if preco and preco > 0:
+            return preco
+    except:
+        pass
+
+    # 3️⃣ fallback para ações com ticker alternativo
+    if not ativo.endswith("-USD") and "-" in ativo:
+        alternativo = ativo.replace("-", ".")
+        await asyncio.sleep(1)
+        try:
+            preco = market.preco_atual(alternativo)
+            if preco and preco > 0:
+                return preco
+        except:
+            pass
+
+    return None
 
 # ─────────────────────────────
 # EMBEDS
@@ -172,6 +193,7 @@ def embed_relatorio(dados, cotacao):
     embed.set_footer(text=f"Atualizado em {agora}")
     return embed
 
+
 def embed_jornal(noticias):
     embed = discord.Embed(
         title="🗞️ Jornal do Mercado Global",
@@ -180,14 +202,8 @@ def embed_jornal(noticias):
     )
 
     embed.add_field(
-        name="🌍 Destaques do Dia",
+        name="🌍 Destaques",
         value="\n\n".join(f"• {n}" for n in noticias[:6]),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Sentimento do Mercado",
-        value=sentimento_mercado(noticias),
         inline=False
     )
 
@@ -195,7 +211,7 @@ def embed_jornal(noticias):
     return embed
 
 # ─────────────────────────────
-# ENVIO DIRETO (USADO POR TESTE E SCHEDULER)
+# ENVIO DE RELATÓRIO (COM VALIDAÇÃO)
 # ─────────────────────────────
 
 async def enviar_relatorio_agora():
@@ -203,24 +219,21 @@ async def enviar_relatorio_agora():
     cotacao = dolar_para_real()
 
     for ativo in config.ATIVOS:
-        try:
-            preco = market.preco_atual(ativo)
-            if preco is None or preco == 0:
+        preco = await buscar_preco_com_fallback(ativo)
+
+        if preco is None:
+            FALHAS_ATIVOS[ativo] = FALHAS_ATIVOS.get(ativo, 0) + 1
+            if FALHAS_ATIVOS[ativo] >= 3:
                 await log_bot(
-                    "Validação de ativo",
-                    f"Preço inválido para `{ativo}`",
-                    tipo="AVISO"
+                    "Ativo instável",
+                    f"`{ativo}` falhou {FALHAS_ATIVOS[ativo]} vezes seguidas.",
+                    tipo="ERRO"
                 )
-                continue
+            continue
+        else:
+            FALHAS_ATIVOS.pop(ativo, None)
 
-            dados[ativo] = preco
-
-        except Exception as e:
-            await log_bot(
-                "Validação de ativo",
-                f"Falha ao buscar `{ativo}`\n{str(e)}",
-                tipo="AVISO"
-            )
+        dados[ativo] = preco
 
     if not dados:
         await log_bot(
@@ -235,16 +248,14 @@ async def enviar_relatorio_agora():
         if canal:
             await canal.send(embed=embed_relatorio(dados, cotacao))
 
+# ─────────────────────────────
+# ENVIO DE JORNAL
+# ─────────────────────────────
 
 async def enviar_jornal_agora():
     noticias = news.noticias()
-
     if not noticias:
-        await log_bot(
-            "Jornal",
-            "Nenhuma notícia retornada.",
-            tipo="AVISO"
-        )
+        await log_bot("Jornal", "Nenhuma notícia retornada.", "AVISO")
         return
 
     if config.CANAL_NOTICIAS:
@@ -262,94 +273,19 @@ async def on_ready():
     scheduler.start()
 
 # ─────────────────────────────
-# COMANDOS ADMIN
+# COMANDO ADMIN (TESTE MANUAL)
 # ─────────────────────────────
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def help(ctx):
-    if not admin_channel_only(ctx):
-        return
-
-    embed = discord.Embed(
-        title="🤖 Atlas Finance Bot — Admin",
-        color=0x3498DB
-    )
-
-    embed.add_field(
-        name="⚙️ Configuração",
-        value="`!setcanaladmin`\n`!setcanal`\n`!setcanalnoticias`\n`!setcanallogs`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧪 Testes",
-        value="`!testenoticias`\n`!testarpublicacoes`\n`!statusbot`\n`!manutencao`",
-        inline=False
-    )
-
-    await ctx.send(embed=embed)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setcanaladmin(ctx):
-    config.CANAL_ADMIN = ctx.channel.id
-    await ctx.send("🔒 Canal admin definido")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setcanal(ctx):
-    config.CANAL_ANALISE = ctx.channel.id
-    await ctx.send("📊 Canal de análises definido")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setcanalnoticias(ctx):
-    config.CANAL_NOTICIAS = ctx.channel.id
-    await ctx.send("📰 Canal de notícias definido")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setcanallogs(ctx):
-    config.CANAL_LOGS = ctx.channel.id
-    await ctx.send("📋 Canal de logs definido")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testenoticias(ctx):
-    if not admin_channel_only(ctx):
-        return
-    await enviar_jornal_agora()
-    await ctx.send("📰 Jornal enviado para teste")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def testarpublicacoes(ctx):
-    if not admin_channel_only(ctx):
-        return
-    await ctx.send("🧪 Enviando publicações manualmente...")
+    await ctx.send("🧪 Enviando publicações...")
     await enviar_relatorio_agora()
     await enviar_jornal_agora()
     await ctx.send("✅ Publicações enviadas")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def statusbot(ctx):
-    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    await ctx.send(f"🤖 Bot online • {agora}")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def manutencao(ctx):
-    try:
-        market.preco_atual("BTC-USD")
-        status = "OK"
-    except:
-        status = "FALHA"
-    await ctx.send(f"🛠️ API de preços: **{status}**")
-
 # ─────────────────────────────
-# SCHEDULER CONFIÁVEL (1 MIN)
+# SCHEDULER CONFIÁVEL
 # ─────────────────────────────
 
 @tasks.loop(minutes=1)
@@ -359,17 +295,14 @@ async def scheduler():
     agora = datetime.now(BR_TZ)
     hora = agora.strftime("%H:%M")
 
-    # RELATÓRIO 06:00
     if hora == "06:00" and ultimo_analise != agora.date():
         await enviar_relatorio_agora()
         ultimo_analise = agora.date()
 
-    # JORNAL 06:00
     if hora == "06:00" and ultimo_jornal_manha != agora.date():
         await enviar_jornal_agora()
         ultimo_jornal_manha = agora.date()
 
-    # JORNAL 18:00
     if hora == "18:00" and ultimo_jornal_tarde != agora.date():
         await enviar_jornal_agora()
         ultimo_jornal_tarde = agora.date()
