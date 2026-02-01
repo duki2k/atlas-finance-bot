@@ -276,8 +276,14 @@ async def testenoticias(ctx):
 async def testarpublicacoes(ctx):
     if not admin_channel_only(ctx):
         return
-    await scheduler()
-    await ctx.send("✅ Publicações disparadas")
+
+    await ctx.send("🧪 Enviando publicações manualmente...")
+
+    await enviar_relatorio_agora()
+    await enviar_jornal_agora()
+
+    await ctx.send("✅ Relatório e jornal enviados com sucesso.")
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -298,6 +304,45 @@ async def manutencao(ctx):
 # ─────────────────────────────
 # SCHEDULER CONFIÁVEL (1 MIN)
 # ─────────────────────────────
+
+async def enviar_relatorio_agora():
+    dados = {}
+    cotacao = dolar_para_real()
+
+    for ativo in config.ATIVOS:
+        try:
+            dados[ativo] = market.preco_atual(ativo)
+        except:
+            await log_bot(
+                "Validação de ativo",
+                f"Falha ao buscar `{ativo}`",
+                tipo="AVISO"
+            )
+
+    if not dados:
+        return
+
+    if config.CANAL_ANALISE:
+        canal = bot.get_channel(config.CANAL_ANALISE)
+        if canal:
+            await canal.send(embed=embed_relatorio(dados, cotacao))
+
+
+async def enviar_jornal_agora():
+    noticias = news.noticias()
+
+    if not noticias:
+        await log_bot(
+            "Jornal",
+            "Nenhuma notícia retornada no envio manual",
+            tipo="AVISO"
+        )
+        return
+
+    if config.CANAL_NOTICIAS:
+        canal = bot.get_channel(config.CANAL_NOTICIAS)
+        if canal:
+            await canal.send(embed=embed_jornal(noticias))
 
 @tasks.loop(minutes=1)
 async def scheduler():
