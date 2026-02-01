@@ -4,14 +4,14 @@ from discord.ext import commands, tasks
 import config
 import market
 import news
+import telegram
 import requests
 from datetime import datetime
 import pytz
 import asyncio
-import whatsapp
 
 # ─────────────────────────────
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES BÁSICAS
 # ─────────────────────────────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -27,14 +27,14 @@ bot = commands.Bot(
 )
 
 # ─────────────────────────────
-# CONTROLE DE DISPARO
+# CONTROLE DE HORÁRIOS
 # ─────────────────────────────
 
 ultimo_manha = None
 ultimo_tarde = None
 
 # ─────────────────────────────
-# MAPA DE NOMES
+# MAPA DE NOMES DOS ATIVOS
 # ─────────────────────────────
 
 ATIVOS_INFO = {
@@ -87,11 +87,13 @@ async def log_bot(titulo, mensagem):
         description=mensagem,
         color=0x3498DB
     )
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
+    embed.set_footer(
+        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    )
     await canal.send(embed=embed)
 
 # ─────────────────────────────
-# EMBEDS
+# EMBEDS DISCORD
 # ─────────────────────────────
 
 def embed_relatorio(dados, cotacao):
@@ -124,7 +126,11 @@ def embed_relatorio(dados, cotacao):
     quedas = sorted(quedas, key=lambda x: x[1])[:3]
 
     sentimento = sentimento_emoji(len(altas), len(quedas))
-    cor = 0x2ECC71 if len(altas) > len(quedas) else 0xE74C3C if len(quedas) > len(altas) else 0xF1C40F
+    cor = (
+        0x2ECC71 if len(altas) > len(quedas)
+        else 0xE74C3C if len(quedas) > len(altas)
+        else 0xF1C40F
+    )
 
     embed = discord.Embed(
         title="📊 Relatório Diário de Ativos",
@@ -147,12 +153,20 @@ def embed_relatorio(dados, cotacao):
         )
 
     if acoes:
-        embed.add_field(name="📈 Ações", value="\n\n".join(acoes), inline=False)
+        embed.add_field(
+            name="📈 Ações",
+            value="\n\n".join(acoes),
+            inline=False
+        )
 
     if criptos:
-        embed.add_field(name="🪙 Criptomoedas", value="\n\n".join(criptos), inline=False)
+        embed.add_field(
+            name="🪙 Criptomoedas",
+            value="\n\n".join(criptos),
+            inline=False
+        )
 
-    embed.set_footer(text="Dados reais do mercado • Atlas Finance Bot")
+    embed.set_footer(text="Dados reais do mercado • Atlas Finance")
     return embed
 
 
@@ -169,8 +183,52 @@ def embed_jornal(noticias):
         inline=False
     )
 
-    embed.set_footer(text="Atlas Finance Bot")
+    embed.set_footer(text="Atlas Finance")
     return embed
+
+# ─────────────────────────────
+# TEXTO PARA TELEGRAM
+# ─────────────────────────────
+
+def gerar_texto_telegram(dados):
+    altas, quedas = [], []
+
+    for ativo, (_, variacao) in dados.items():
+        nome = ATIVOS_INFO.get(ativo, ativo)
+        if variacao > 0:
+            altas.append((nome, variacao))
+        elif variacao < 0:
+            quedas.append((nome, variacao))
+
+    altas = sorted(altas, key=lambda x: x[1], reverse=True)[:3]
+    quedas = sorted(quedas, key=lambda x: x[1])[:3]
+
+    sentimento = sentimento_emoji(len(altas), len(quedas))
+
+    texto = f"📊 *Resumo do Mercado*\n{sentimento}\n\n"
+
+    if altas:
+        texto += "🔝 *Top Altas*\n"
+        for n, v in altas:
+            texto += f"• {n}: +{v:.2f}%\n"
+        texto += "\n"
+
+    if quedas:
+        texto += "🔻 *Top Quedas*\n"
+        for n, v in quedas:
+            texto += f"• {n}: {v:.2f}%\n"
+        texto += "\n"
+
+    texto += "🧠 *Postura do dia*\n"
+    if len(altas) > len(quedas):
+        texto += "Cenário favorável, mas com gestão de risco.\n"
+    elif len(quedas) > len(altas):
+        texto += "Cautela. Priorize proteção de capital.\n"
+    else:
+        texto += "Mercado lateral. Seja seletivo.\n"
+
+    texto += "\n— Atlas Finance"
+    return texto
 
 # ─────────────────────────────
 # ENVIO DE CONTEÚDO
@@ -187,17 +245,19 @@ async def enviar_relatorio():
                 continue
             dados[ativo] = (preco, variacao)
         except Exception as e:
-            await log_bot("Erro ativo", f"{ativo}\n{e}")
+            await log_bot("Erro ao buscar ativo", f"{ativo}\n{e}")
 
     if not dados:
         return
 
+    # Discord
     canal = bot.get_channel(config.CANAL_ANALISE)
     if canal:
         await canal.send(embed=embed_relatorio(dados, cotacao))
 
-    texto = gerar_recomendacao_whatsapp(dados)
-    whatsapp.enviar_whatsapp(texto)
+    # Telegram
+    texto = gerar_texto_telegram(dados)
+    telegram.enviar_telegram(texto)
 
 
 async def enviar_jornal():
@@ -208,34 +268,6 @@ async def enviar_jornal():
     canal = bot.get_channel(config.CANAL_NOTICIAS)
     if canal:
         await canal.send(embed=embed_jornal(noticias))
-
-# ─────────────────────────────
-# TEXTO WHATSAPP
-# ─────────────────────────────
-
-def gerar_recomendacao_whatsapp(dados):
-    altas, quedas = [], []
-
-    for _, (preco, variacao) in dados.items():
-        if variacao > 0:
-            altas.append(variacao)
-        elif variacao < 0:
-            quedas.append(variacao)
-
-    sentimento = sentimento_emoji(len(altas), len(quedas))
-
-    texto = f"📊 *Resumo do Mercado*\n{sentimento}\n\n"
-
-    texto += "🧠 *Postura do dia*\n"
-    if len(altas) > len(quedas):
-        texto += "Mercado mais favorável, mas com cautela.\n"
-    elif len(quedas) > len(altas):
-        texto += "Cenário defensivo. Preserve capital.\n"
-    else:
-        texto += "Mercado lateral. Seletividade é chave.\n"
-
-    texto += "\n— Atlas Finance"
-    return texto
 
 # ─────────────────────────────
 # EVENTO READY
@@ -254,9 +286,9 @@ async def on_ready():
 @commands.has_permissions(administrator=True)
 async def comandos(ctx):
     await ctx.send(
-        "**Comandos disponíveis:**\n"
-        "!testarpublicacoes\n"
-        "!reiniciar"
+        "**📌 Comandos disponíveis (Admin):**\n"
+        "`!testarpublicacoes` → envia relatório + jornal agora\n"
+        "`!reiniciar` → reinicia o bot"
     )
 
 
@@ -276,7 +308,7 @@ async def reiniciar(ctx):
     await bot.close()
 
 # ─────────────────────────────
-# SCHEDULER
+# SCHEDULER AUTOMÁTICO
 # ─────────────────────────────
 
 @tasks.loop(minutes=1)
