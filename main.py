@@ -9,9 +9,7 @@ from datetime import datetime
 import pytz
 import asyncio
 
-# ─────────────────────────────
-# CONFIGURAÇÕES BÁSICAS
-# ─────────────────────────────
+# ───── CONFIGURAÇÃO ─────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
@@ -19,11 +17,13 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
 
-# ─────────────────────────────
-# ESTADO GLOBAL
-# ─────────────────────────────
+# ───── ESTADO ─────
 
 ultimo_analise = None
 ultimo_jornal_manha = None
@@ -32,12 +32,9 @@ ultimo_jornal_tarde = None
 ULTIMOS_PRECOS = {}
 FALHAS_ATIVOS = {}
 
-# ─────────────────────────────
-# MAPA DE ATIVOS
-# ─────────────────────────────
+# ───── MAPA DE ATIVOS ─────
 
 ATIVOS_INFO = {
-    # Ações
     "AAPL": ("Apple Inc.", "Ação EUA"),
     "MSFT": ("Microsoft Corporation", "Ação EUA"),
     "AMZN": ("Amazon.com Inc.", "Ação EUA"),
@@ -46,16 +43,12 @@ ATIVOS_INFO = {
     "NVDA": ("NVIDIA Corporation", "Ação EUA"),
     "META": ("Meta Platforms Inc.", "Ação EUA"),
     "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
-
-    # Criptomoedas
     "BTC-USD": ("Bitcoin", "Criptomoeda"),
     "ETH-USD": ("Ethereum", "Criptomoeda"),
     "SOL-USD": ("Solana", "Criptomoeda"),
 }
 
-# ─────────────────────────────
-# FUNÇÕES AUXILIARES
-# ─────────────────────────────
+# ───── UTILIDADES ─────
 
 def dolar_para_real():
     try:
@@ -68,37 +61,9 @@ def dolar_para_real():
         return 5.0
 
 
-def calcular_variacao(ativo, preco_atual):
-    anterior = ULTIMOS_PRECOS.get(ativo)
-    ULTIMOS_PRECOS[ativo] = preco_atual
-
-    if not anterior or anterior == 0:
-        return 0.0, "⏺️ 0.00%"
-
-    variacao = ((preco_atual - anterior) / anterior) * 100
-
-    if variacao > 0:
-        return variacao, f"🔼 +{variacao:.2f}%"
-    elif variacao < 0:
-        return variacao, f"🔽 {variacao:.2f}%"
-    return 0.0, "⏺️ 0.00%"
-
-
-def cor_dinamica(variacoes):
-    altas = sum(1 for v in variacoes if v > 0)
-    baixas = sum(1 for v in variacoes if v < 0)
-
-    if altas > baixas:
-        return 0x2ECC71
-    elif baixas > altas:
-        return 0xE74C3C
-    return 0xF1C40F
-
-
-async def log_bot(titulo, mensagem, tipo="INFO"):
+async def log_bot(titulo, msg, tipo="INFO"):
     if not config.CANAL_LOGS:
         return
-
     canal = bot.get_channel(config.CANAL_LOGS)
     if not canal:
         return
@@ -112,19 +77,15 @@ async def log_bot(titulo, mensagem, tipo="INFO"):
 
     embed = discord.Embed(
         title=f"📋 {titulo}",
-        description=mensagem,
+        description=msg,
         color=cores.get(tipo, 0x95A5A6)
     )
 
     embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
 
-# ─────────────────────────────
-# FALLBACK DE PREÇO (AÇÕES + CRIPTOS)
-# ─────────────────────────────
 
 async def buscar_preco_com_fallback(ativo):
-    # 1️⃣ tentativa padrão
     try:
         preco = market.preco_atual(ativo)
         if preco and preco > 0:
@@ -132,8 +93,8 @@ async def buscar_preco_com_fallback(ativo):
     except:
         pass
 
-    # 2️⃣ retry simples
     await asyncio.sleep(1)
+
     try:
         preco = market.preco_atual(ativo)
         if preco and preco > 0:
@@ -141,10 +102,8 @@ async def buscar_preco_com_fallback(ativo):
     except:
         pass
 
-    # 3️⃣ fallback para ações com ticker alternativo
     if not ativo.endswith("-USD") and "-" in ativo:
         alternativo = ativo.replace("-", ".")
-        await asyncio.sleep(1)
         try:
             preco = market.preco_atual(alternativo)
             if preco and preco > 0:
@@ -154,9 +113,31 @@ async def buscar_preco_com_fallback(ativo):
 
     return None
 
-# ─────────────────────────────
-# EMBEDS
-# ─────────────────────────────
+
+def calcular_variacao(ativo, preco):
+    anterior = ULTIMOS_PRECOS.get(ativo)
+    ULTIMOS_PRECOS[ativo] = preco
+
+    if not anterior:
+        return 0.0, "⏺️ 0.00%"
+
+    v = ((preco - anterior) / anterior) * 100
+    if v > 0:
+        return v, f"🔼 +{v:.2f}%"
+    elif v < 0:
+        return v, f"🔽 {v:.2f}%"
+    return 0.0, "⏺️ 0.00%"
+
+
+def cor_dinamica(vals):
+    pos = sum(1 for v in vals if v > 0)
+    neg = sum(1 for v in vals if v < 0)
+    if pos > neg:
+        return 0x2ECC71
+    if neg > pos:
+        return 0xE74C3C
+    return 0xF1C40F
+
 
 def embed_relatorio(dados, cotacao):
     agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
@@ -165,13 +146,13 @@ def embed_relatorio(dados, cotacao):
 
     for ativo, preco in dados.items():
         nome, _ = ATIVOS_INFO.get(ativo, (ativo, ""))
-        v_num, v_txt = calcular_variacao(ativo, preco)
-        variacoes.append(v_num)
+        vnum, vtxt = calcular_variacao(ativo, preco)
+        variacoes.append(vnum)
 
         linha = (
             f"**{nome}** (`{ativo}`)\n"
             f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}\n"
-            f"📉 Variação: {v_txt}"
+            f"📉 {vtxt}"
         )
 
         if ativo.endswith("-USD"):
@@ -207,14 +188,11 @@ def embed_jornal(noticias):
         inline=False
     )
 
-    embed.set_footer(text="Atlas Finance Bot • Atualização automática")
+    embed.set_footer(text="Atlas Finance Bot")
     return embed
 
-# ─────────────────────────────
-# ENVIO DE RELATÓRIO (COM VALIDAÇÃO)
-# ─────────────────────────────
 
-async def enviar_relatorio_agora():
+async def enviar_relatorio():
     dados = {}
     cotacao = dolar_para_real()
 
@@ -224,69 +202,84 @@ async def enviar_relatorio_agora():
         if preco is None:
             FALHAS_ATIVOS[ativo] = FALHAS_ATIVOS.get(ativo, 0) + 1
             if FALHAS_ATIVOS[ativo] >= 3:
-                await log_bot(
-                    "Ativo instável",
-                    f"`{ativo}` falhou {FALHAS_ATIVOS[ativo]} vezes seguidas.",
-                    tipo="ERRO"
-                )
+                await log_bot("Ativo instável", ativo, "ERRO")
             continue
         else:
             FALHAS_ATIVOS.pop(ativo, None)
 
         dados[ativo] = preco
 
-    if not dados:
-        await log_bot(
-            "Relatório diário",
-            "Nenhum ativo válido encontrado.",
-            tipo="ERRO"
-        )
+    if not dados or not config.CANAL_ANALISE:
         return
 
-    if config.CANAL_ANALISE:
-        canal = bot.get_channel(config.CANAL_ANALISE)
-        if canal:
-            await canal.send(embed=embed_relatorio(dados, cotacao))
+    canal = bot.get_channel(config.CANAL_ANALISE)
+    if canal:
+        await canal.send(embed=embed_relatorio(dados, cotacao))
 
-# ─────────────────────────────
-# ENVIO DE JORNAL
-# ─────────────────────────────
 
-async def enviar_jornal_agora():
+async def enviar_jornal():
     noticias = news.noticias()
-    if not noticias:
-        await log_bot("Jornal", "Nenhuma notícia retornada.", "AVISO")
+    if not noticias or not config.CANAL_NOTICIAS:
         return
 
-    if config.CANAL_NOTICIAS:
-        canal = bot.get_channel(config.CANAL_NOTICIAS)
-        if canal:
-            await canal.send(embed=embed_jornal(noticias))
+    canal = bot.get_channel(config.CANAL_NOTICIAS)
+    if canal:
+        await canal.send(embed=embed_jornal(noticias))
 
-# ─────────────────────────────
-# EVENTO READY
-# ─────────────────────────────
+
+# ───── EVENTO ─────
 
 @bot.event
 async def on_ready():
     print(f"🤖 Conectado como {bot.user}")
     scheduler.start()
 
-# ─────────────────────────────
-# COMANDO ADMIN (TESTE MANUAL)
-# ─────────────────────────────
+
+# ───── COMANDOS ADMIN ─────
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def help(ctx):
+    await ctx.send(
+        "**Comandos Admin:**\n"
+        "!setcanal\n"
+        "!setcanalnoticias\n"
+        "!setcanallogs\n"
+        "!testarpublicacoes"
+    )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanal(ctx):
+    config.CANAL_ANALISE = ctx.channel.id
+    await ctx.send("📊 Canal de análises definido")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanalnoticias(ctx):
+    config.CANAL_NOTICIAS = ctx.channel.id
+    await ctx.send("📰 Canal de notícias definido")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setcanallogs(ctx):
+    config.CANAL_LOGS = ctx.channel.id
+    await ctx.send("📋 Canal de logs definido")
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def testarpublicacoes(ctx):
     await ctx.send("🧪 Enviando publicações...")
-    await enviar_relatorio_agora()
-    await enviar_jornal_agora()
+    await enviar_relatorio()
+    await enviar_jornal()
     await ctx.send("✅ Publicações enviadas")
 
-# ─────────────────────────────
-# SCHEDULER CONFIÁVEL
-# ─────────────────────────────
+
+# ───── SCHEDULER ─────
 
 @tasks.loop(minutes=1)
 async def scheduler():
@@ -296,19 +289,18 @@ async def scheduler():
     hora = agora.strftime("%H:%M")
 
     if hora == "06:00" and ultimo_analise != agora.date():
-        await enviar_relatorio_agora()
+        await enviar_relatorio()
         ultimo_analise = agora.date()
 
     if hora == "06:00" and ultimo_jornal_manha != agora.date():
-        await enviar_jornal_agora()
+        await enviar_jornal()
         ultimo_jornal_manha = agora.date()
 
     if hora == "18:00" and ultimo_jornal_tarde != agora.date():
-        await enviar_jornal_agora()
+        await enviar_jornal()
         ultimo_jornal_tarde = agora.date()
 
-# ─────────────────────────────
-# START
-# ─────────────────────────────
+
+# ───── START ─────
 
 bot.run(TOKEN)
