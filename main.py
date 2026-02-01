@@ -28,9 +28,11 @@ bot = commands.Bot(
 # CONTROLE DE DISPARO
 # ─────────────────────────────
 
-ultimo_envio_analise = None
-ultimo_envio_jornal_manha = None
-ultimo_envio_jornal_tarde = None
+ultimo_analise = None
+ultimo_jornal_manha = None
+ultimo_jornal_tarde = None
+
+ULTIMOS_PRECOS = {}
 
 # ─────────────────────────────
 # MAPA DE ATIVOS
@@ -53,6 +55,9 @@ ATIVOS_INFO = {
 # FUNÇÕES AUXILIARES
 # ─────────────────────────────
 
+def admin_channel_only(ctx):
+    return config.CANAL_ADMIN and ctx.channel.id == config.CANAL_ADMIN
+
 def dolar_para_real():
     try:
         r = requests.get(
@@ -62,6 +67,32 @@ def dolar_para_real():
         return float(r["rates"]["BRL"])
     except:
         return 5.0
+
+def calcular_variacao(ativo, preco_atual):
+    anterior = ULTIMOS_PRECOS.get(ativo)
+    ULTIMOS_PRECOS[ativo] = preco_atual
+
+    if not anterior:
+        return 0.0, "⏺️ 0.00%"
+
+    variacao = ((preco_atual - anterior) / anterior) * 100
+
+    if variacao > 0:
+        return variacao, f"🔼 +{variacao:.2f}%"
+    elif variacao < 0:
+        return variacao, f"🔽 {variacao:.2f}%"
+    else:
+        return 0.0, "⏺️ 0.00%"
+
+def cor_dinamica(variacoes):
+    altas = len([v for v in variacoes if v > 0])
+    baixas = len([v for v in variacoes if v < 0])
+
+    if altas > baixas:
+        return 0x2ECC71  # verde
+    elif baixas > altas:
+        return 0xE74C3C  # vermelho
+    return 0xF1C40F      # amarelo
 
 def sentimento_mercado(noticias):
     texto = " ".join(noticias).lower()
@@ -76,53 +107,121 @@ def sentimento_mercado(noticias):
         return "🔴 Defensivo"
     return "🟡 Neutro"
 
+async def log_bot(titulo, mensagem, tipo="INFO"):
+    if not config.CANAL_LOGS:
+        return
+
+    canal = bot.get_channel(config.CANAL_LOGS)
+    if not canal:
+        return
+
+    cores = {
+        "INFO": 0x3498DB,
+        "SUCESSO": 0x2ECC71,
+        "AVISO": 0xF1C40F,
+        "ERRO": 0xE74C3C
+    }
+
+    embed = discord.Embed(
+        title=f"📋 {titulo}",
+        description=mensagem,
+        color=cores.get(tipo, 0x95A5A6)
+    )
+
+    embed.set_footer(
+        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    )
+
+    await canal.send(embed=embed)
+
+# ─────────────────────────────
+# EMBED RELATÓRIO (COR DINÂMICA)
+# ─────────────────────────────
+
 def embed_relatorio(dados, cotacao):
     agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
 
-    embed = discord.Embed(
-        title="📊 Relatório Diário de Ativos",
-        description="Visão consolidada do mercado",
-        color=0x1ABC9C
-    )
-
     acoes = []
     criptos = []
+    variacoes = []
 
     for ativo, preco in dados.items():
         nome, _ = ATIVOS_INFO.get(ativo, (ativo, ""))
-        linha = f"**{nome}** (`{ativo}`)\n💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}"
+        variacao_num, variacao_txt = calcular_variacao(ativo, preco)
+        variacoes.append(variacao_num)
+
+        linha = (
+            f"**{nome}** (`{ativo}`)\n"
+            f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}\n"
+            f"📉 Variação: {variacao_txt}"
+        )
 
         if ativo.endswith("-USD"):
             criptos.append(linha)
         else:
             acoes.append(linha)
 
-    if acoes:
-        embed.add_field(name="📈 Ações", value="\n\n".join(acoes), inline=False)
-    if criptos:
-        embed.add_field(name="🪙 Criptomoedas", value="\n\n".join(criptos), inline=False)
+    embed = discord.Embed(
+        title="📊 Relatório Diário de Ativos",
+        description="Panorama consolidado do mercado",
+        color=cor_dinamica(variacoes)
+    )
 
-    embed.set_footer(text=f"Atlas Community ® 2026 • Atualizado em {agora}")
+    if acoes:
+        embed.add_field(
+            name="📈 Ações",
+            value="\n\n".join(acoes),
+            inline=False
+        )
+
+    if criptos:
+        embed.add_field(
+            name="🪙 Criptomoedas",
+            value="\n\n".join(criptos),
+            inline=False
+        )
+
+    embed.set_footer(text=f"Atlas Comunnity • Atualizado em {agora}")
     return embed
+
+# ─────────────────────────────
+# EMBED JORNAL (VISUAL MELHORADO)
+# ─────────────────────────────
 
 def embed_jornal(noticias):
     embed = discord.Embed(
         title="🗞️ Jornal do Mercado Global",
-        color=0xF39C12
+        description="Resumo das principais notícias financeiras",
+        color=0x3498DB
     )
 
+    destaques = []
+    for i, n in enumerate(noticias[:6], start=1):
+        destaques.append(f"**{i}.** {n}")
+
     embed.add_field(
-        name="🌍 Destaques",
-        value="\n\n".join(f"• {n}" for n in noticias[:6]),
+        name="🌍 Destaques do Dia",
+        value="\n\n".join(destaques),
         inline=False
     )
 
     embed.add_field(
-        name="📊 Sentimento",
+        name="📊 Sentimento do Mercado",
         value=sentimento_mercado(noticias),
         inline=False
     )
 
+    embed.add_field(
+        name="🧠 Leitura do Bot",
+        value=(
+            "• Priorize gestão de risco\n"
+            "• Evite decisões impulsivas\n"
+            "• Confirme tendências antes de operar"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Atlas Community • Atualização automática")
     return embed
 
 # ─────────────────────────────
@@ -135,52 +234,51 @@ async def on_ready():
     scheduler.start()
 
 # ─────────────────────────────
-# SCHEDULER CONFIÁVEL (1 MINUTO)
+# SCHEDULER CONFIÁVEL (1 MIN)
 # ─────────────────────────────
 
 @tasks.loop(minutes=1)
 async def scheduler():
-    global ultimo_envio_analise
-    global ultimo_envio_jornal_manha
-    global ultimo_envio_jornal_tarde
+    global ultimo_analise, ultimo_jornal_manha, ultimo_jornal_tarde
 
     agora = datetime.now(BR_TZ)
-    hora_min = agora.strftime("%H:%M")
+    hora = agora.strftime("%H:%M")
 
-    # ───── ANÁLISE 06:00 ─────
-    if hora_min == "06:00" and ultimo_envio_analise != agora.date():
+    # ───── RELATÓRIO 06:00 ─────
+    if hora == "06:00" and ultimo_analise != agora.date():
         dados = {}
         cotacao = dolar_para_real()
 
         for ativo in config.ATIVOS:
             try:
                 dados[ativo] = market.preco_atual(ativo)
-            except:
-                pass
+            except Exception as e:
+                await log_bot(
+                    "Validação de ativo",
+                    f"Falha ao buscar `{ativo}`",
+                    tipo="AVISO"
+                )
 
         if dados and config.CANAL_ANALISE:
             canal = bot.get_channel(config.CANAL_ANALISE)
             await canal.send(embed=embed_relatorio(dados, cotacao))
-            ultimo_envio_analise = agora.date()
+            ultimo_analise = agora.date()
 
     # ───── JORNAL 06:00 ─────
-    if hora_min == "06:00" and ultimo_envio_jornal_manha != agora.date():
+    if hora == "06:00" and ultimo_jornal_manha != agora.date():
         noticias = news.noticias()
         if noticias and config.CANAL_NOTICIAS:
             canal = bot.get_channel(config.CANAL_NOTICIAS)
             await canal.send(embed=embed_jornal(noticias))
-            ultimo_envio_jornal_manha = agora.date()
+            ultimo_jornal_manha = agora.date()
 
     # ───── JORNAL 18:00 ─────
-    if hora_min == "18:00" and ultimo_envio_jornal_tarde != agora.date():
+    if hora == "18:00" and ultimo_jornal_tarde != agora.date():
         noticias = news.noticias()
         if noticias and config.CANAL_NOTICIAS:
             canal = bot.get_channel(config.CANAL_NOTICIAS)
             await canal.send(embed=embed_jornal(noticias))
-            ultimo_envio_jornal_tarde = agora.date()
-
-embed.set_footer(text=f"Atlas Community ® 2026 • Atualizado em {agora}")
-    return embed
+            ultimo_jornal_tarde = agora.date()
 
 # ─────────────────────────────
 # START
