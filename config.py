@@ -1,14 +1,32 @@
+# ───── ATIVOS MONITORADOS ─────
+
 ATIVOS = [
-    "BTC-USD","ETH-USD","SOL-USD","USDT-USD","BNB-USD","XRP-USD","ADA-USD",
-    "AAPL","MSFT","AMZN","GOOGL","TSLA","NVDA","META","BRK-B",
-    "JPM","V","MA","UNH","DIS","PG","KO","PEP","INTC","CSCO",
-    "XOM","CVX","BAC","WMT","HD","VZ","ADBE"
+    # 🪙 Criptomoedas
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "ADA-USD",
+    "XRP-USD",
+    "BNB-USD",
+
+    # 📈 Ações EUA
+    "AAPL",
+    "MSFT",
+    "AMZN",
+    "GOOGL",
+    "TSLA",
+    "NVDA",
+    "META",
+    "BRK-B",
 ]
 
-INTERVALO_MINUTOS = 720
+# ───── CONFIGURAÇÕES GERAIS ─────
+
 NEWS_ATIVAS = True
-CANAL_ANALISE = None
-CANAL_NOTICIAS = None
-CANAL_ADMIN = None
-CANAL_ADMIN = None
-CANAL_LOGS = None
+
+# ───── IDS FIXOS DOS CANAIS ─────
+
+CANAL_ADMIN    = 1467296892256911493
+CANAL_ANALISE  = 1466255506657251469
+CANAL_NOTICIAS = 1466895475415191583
+CANAL_LOGS     = 1467579765274837064
