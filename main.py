@@ -8,9 +8,10 @@ import requests
 from datetime import datetime
 import pytz
 import asyncio
+import whatsapp
 
 # ─────────────────────────────
-# CONFIGURAÇÕES BÁSICAS
+# CONFIGURAÇÕES
 # ─────────────────────────────
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,42 +27,35 @@ bot = commands.Bot(
 )
 
 # ─────────────────────────────
-# ESTADO DO BOT
+# CONTROLE DE DISPARO
 # ─────────────────────────────
 
-ultimo_relatorio = None
-ultimo_jornal_manha = None
-ultimo_jornal_tarde = None
-
-ULTIMOS_PRECOS = {}
-FALHAS_ATIVOS = {}
+ultimo_manha = None
+ultimo_tarde = None
 
 # ─────────────────────────────
-# MAPA DE ATIVOS (NOME + TIPO)
+# MAPA DE NOMES
 # ─────────────────────────────
 
 ATIVOS_INFO = {
-    # Ações
-    "AAPL": ("Apple Inc.", "Ação EUA"),
-    "MSFT": ("Microsoft Corporation", "Ação EUA"),
-    "AMZN": ("Amazon.com Inc.", "Ação EUA"),
-    "GOOGL": ("Alphabet Inc. (Google)", "Ação EUA"),
-    "TSLA": ("Tesla Inc.", "Ação EUA"),
-    "NVDA": ("NVIDIA Corporation", "Ação EUA"),
-    "META": ("Meta Platforms Inc.", "Ação EUA"),
-    "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
-
-    # Criptos
-    "BTC-USD": ("Bitcoin", "Criptomoeda"),
-    "ETH-USD": ("Ethereum", "Criptomoeda"),
-    "SOL-USD": ("Solana", "Criptomoeda"),
-    "ADA-USD": ("Cardano", "Criptomoeda"),
-    "XRP-USD": ("XRP", "Criptomoeda"),
-    "BNB-USD": ("Binance Coin", "Criptomoeda"),
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "AMZN": "Amazon",
+    "GOOGL": "Google",
+    "TSLA": "Tesla",
+    "NVDA": "Nvidia",
+    "META": "Meta",
+    "BRK-B": "Berkshire Hathaway",
+    "BTC-USD": "Bitcoin",
+    "ETH-USD": "Ethereum",
+    "SOL-USD": "Solana",
+    "ADA-USD": "Cardano",
+    "XRP-USD": "XRP",
+    "BNB-USD": "Binance Coin"
 }
 
 # ─────────────────────────────
-# FUNÇÕES AUXILIARES
+# UTILIDADES
 # ─────────────────────────────
 
 def dolar_para_real():
@@ -75,136 +69,103 @@ def dolar_para_real():
         return 5.0
 
 
-async def log_bot(titulo, mensagem, tipo="INFO"):
+def sentimento_emoji(positivos, negativos):
+    if positivos > negativos:
+        return "😄 Mercado positivo"
+    if negativos > positivos:
+        return "😨 Mercado defensivo"
+    return "😐 Mercado neutro"
+
+
+async def log_bot(titulo, mensagem):
     canal = bot.get_channel(config.CANAL_LOGS)
     if not canal:
         return
 
-    cores = {
-        "INFO": 0x3498DB,
-        "SUCESSO": 0x2ECC71,
-        "AVISO": 0xF1C40F,
-        "ERRO": 0xE74C3C
-    }
-
     embed = discord.Embed(
         title=f"📋 {titulo}",
         description=mensagem,
-        color=cores.get(tipo, 0x95A5A6)
+        color=0x3498DB
     )
-
-    embed.set_footer(
-        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    )
-
+    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
-
-
-async def buscar_preco_com_fallback(ativo):
-    # tentativa principal
-    try:
-        preco = market.preco_atual(ativo)
-        if preco and preco > 0:
-            return preco
-    except:
-        pass
-
-    # retry simples
-    await asyncio.sleep(1)
-    try:
-        preco = market.preco_atual(ativo)
-        if preco and preco > 0:
-            return preco
-    except:
-        pass
-
-    # fallback de ticker (ações com hífen)
-    if not ativo.endswith("-USD") and "-" in ativo:
-        alt = ativo.replace("-", ".")
-        try:
-            preco = market.preco_atual(alt)
-            if preco and preco > 0:
-                return preco
-        except:
-            pass
-
-    return None
-
-
-def calcular_variacao(ativo, preco):
-    anterior = ULTIMOS_PRECOS.get(ativo)
-    ULTIMOS_PRECOS[ativo] = preco
-
-    if not anterior:
-        return 0.0, "⏺️ 0.00%"
-
-    v = ((preco - anterior) / anterior) * 100
-    if v > 0:
-        return v, f"🔼 +{v:.2f}%"
-    elif v < 0:
-        return v, f"🔽 {v:.2f}%"
-    return 0.0, "⏺️ 0.00%"
-
-
-def cor_dinamica(valores):
-    pos = sum(1 for v in valores if v > 0)
-    neg = sum(1 for v in valores if v < 0)
-    if pos > neg:
-        return 0x2ECC71
-    if neg > pos:
-        return 0xE74C3C
-    return 0xF1C40F
 
 # ─────────────────────────────
 # EMBEDS
 # ─────────────────────────────
 
 def embed_relatorio(dados, cotacao):
-    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    variacoes = []
     acoes, criptos = [], []
+    altas, quedas = [], []
 
-    for ativo, preco in dados.items():
-        nome, _ = ATIVOS_INFO.get(ativo, (ativo, ""))
-        vnum, vtxt = calcular_variacao(ativo, preco)
-        variacoes.append(vnum)
+    for ativo, (preco, variacao) in dados.items():
+        nome = ATIVOS_INFO.get(ativo, ativo)
+
+        emoji = "🔼" if variacao > 0 else "🔽" if variacao < 0 else "⏺️"
+        texto_var = f"{emoji} {variacao:.2f}%"
 
         linha = (
             f"**{nome}** (`{ativo}`)\n"
-            f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}\n"
-            f"📉 {vtxt}"
+            f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco * cotacao:,.2f}\n"
+            f"📉 {texto_var}"
         )
+
+        if variacao > 0:
+            altas.append((nome, variacao))
+        elif variacao < 0:
+            quedas.append((nome, variacao))
 
         if ativo.endswith("-USD"):
             criptos.append(linha)
         else:
             acoes.append(linha)
 
+    altas = sorted(altas, key=lambda x: x[1], reverse=True)[:3]
+    quedas = sorted(quedas, key=lambda x: x[1])[:3]
+
+    sentimento = sentimento_emoji(len(altas), len(quedas))
+    cor = 0x2ECC71 if len(altas) > len(quedas) else 0xE74C3C if len(quedas) > len(altas) else 0xF1C40F
+
     embed = discord.Embed(
         title="📊 Relatório Diário de Ativos",
-        description="Panorama consolidado do mercado",
-        color=cor_dinamica(variacoes)
+        description=sentimento,
+        color=cor
     )
+
+    if altas:
+        embed.add_field(
+            name="🔝 Top 3 Altas",
+            value="\n".join(f"{n} (+{v:.2f}%)" for n, v in altas),
+            inline=False
+        )
+
+    if quedas:
+        embed.add_field(
+            name="🔻 Top 3 Quedas",
+            value="\n".join(f"{n} ({v:.2f}%)" for n, v in quedas),
+            inline=False
+        )
 
     if acoes:
         embed.add_field(name="📈 Ações", value="\n\n".join(acoes), inline=False)
+
     if criptos:
         embed.add_field(name="🪙 Criptomoedas", value="\n\n".join(criptos), inline=False)
 
-    embed.set_footer(text=f"Atualizado em {agora}")
+    embed.set_footer(text="Dados reais do mercado • Atlas Finance Bot")
     return embed
 
 
 def embed_jornal(noticias):
     embed = discord.Embed(
-        title="🗞️ Jornal do Mercado Global",
-        description="Resumo das principais notícias financeiras",
-        color=0x3498DB
+        title="🗞️🌍 Jornal do Mercado",
+        description="Resumo do que está movimentando o mercado hoje 🚀",
+        color=0x00BFFF
     )
 
     embed.add_field(
-        name="🌍 Destaques",
-        value="\n\n".join(f"• {n}" for n in noticias[:6]),
+        name="🔥 Manchetes",
+        value="\n\n".join(f"📰 {n}" for n in noticias[:6]),
         inline=False
     )
 
@@ -220,21 +181,13 @@ async def enviar_relatorio():
     cotacao = dolar_para_real()
 
     for ativo in config.ATIVOS:
-        preco = await buscar_preco_com_fallback(ativo)
-
-        if preco is None:
-            FALHAS_ATIVOS[ativo] = FALHAS_ATIVOS.get(ativo, 0) + 1
-            if FALHAS_ATIVOS[ativo] >= 3:
-                await log_bot(
-                    "Ativo instável",
-                    f"`{ativo}` falhou {FALHAS_ATIVOS[ativo]} vezes seguidas.",
-                    "ERRO"
-                )
-            continue
-        else:
-            FALHAS_ATIVOS.pop(ativo, None)
-
-        dados[ativo] = preco
+        try:
+            preco, variacao = market.dados_ativo(ativo)
+            if preco is None or variacao is None:
+                continue
+            dados[ativo] = (preco, variacao)
+        except Exception as e:
+            await log_bot("Erro ativo", f"{ativo}\n{e}")
 
     if not dados:
         return
@@ -242,6 +195,9 @@ async def enviar_relatorio():
     canal = bot.get_channel(config.CANAL_ANALISE)
     if canal:
         await canal.send(embed=embed_relatorio(dados, cotacao))
+
+    texto = gerar_recomendacao_whatsapp(dados)
+    whatsapp.enviar_whatsapp(texto)
 
 
 async def enviar_jornal():
@@ -254,6 +210,34 @@ async def enviar_jornal():
         await canal.send(embed=embed_jornal(noticias))
 
 # ─────────────────────────────
+# TEXTO WHATSAPP
+# ─────────────────────────────
+
+def gerar_recomendacao_whatsapp(dados):
+    altas, quedas = [], []
+
+    for _, (preco, variacao) in dados.items():
+        if variacao > 0:
+            altas.append(variacao)
+        elif variacao < 0:
+            quedas.append(variacao)
+
+    sentimento = sentimento_emoji(len(altas), len(quedas))
+
+    texto = f"📊 *Resumo do Mercado*\n{sentimento}\n\n"
+
+    texto += "🧠 *Postura do dia*\n"
+    if len(altas) > len(quedas):
+        texto += "Mercado mais favorável, mas com cautela.\n"
+    elif len(quedas) > len(altas):
+        texto += "Cenário defensivo. Preserve capital.\n"
+    else:
+        texto += "Mercado lateral. Seletividade é chave.\n"
+
+    texto += "\n— Atlas Finance"
+    return texto
+
+# ─────────────────────────────
 # EVENTO READY
 # ─────────────────────────────
 
@@ -263,37 +247,53 @@ async def on_ready():
     scheduler.start()
 
 # ─────────────────────────────
-# COMANDO ADMIN (ÚNICO NECESSÁRIO)
+# COMANDOS ADMIN
 # ─────────────────────────────
+
+@bot.command(name="comandos")
+@commands.has_permissions(administrator=True)
+async def comandos(ctx):
+    await ctx.send(
+        "**Comandos disponíveis:**\n"
+        "!testarpublicacoes\n"
+        "!reiniciar"
+    )
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def testarpublicacoes(ctx):
-    await ctx.send("🧪 Enviando publicações...")
     await enviar_relatorio()
     await enviar_jornal()
     await ctx.send("✅ Publicações enviadas")
 
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def reiniciar(ctx):
+    await ctx.send("🔄 Reiniciando bot...")
+    await asyncio.sleep(2)
+    await bot.close()
+
 # ─────────────────────────────
-# SCHEDULER AUTOMÁTICO
+# SCHEDULER
 # ─────────────────────────────
 
 @tasks.loop(minutes=1)
 async def scheduler():
-    global ultimo_relatorio, ultimo_jornal_manha, ultimo_jornal_tarde
+    global ultimo_manha, ultimo_tarde
 
     agora = datetime.now(BR_TZ)
     hora = agora.strftime("%H:%M")
 
-    if hora == "06:00" and ultimo_relatorio != agora.date():
+    if hora == "06:00" and ultimo_manha != agora.date():
         await enviar_relatorio()
         await enviar_jornal()
-        ultimo_relatorio = agora.date()
-        ultimo_jornal_manha = agora.date()
+        ultimo_manha = agora.date()
 
-    if hora == "18:00" and ultimo_jornal_tarde != agora.date():
+    if hora == "18:00" and ultimo_tarde != agora.date():
         await enviar_jornal()
-        ultimo_jornal_tarde = agora.date()
+        ultimo_tarde = agora.date()
 
 # ─────────────────────────────
 # START
