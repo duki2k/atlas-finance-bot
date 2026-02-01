@@ -279,7 +279,15 @@ async def testarpublicacoes(ctx):
 
     await ctx.send("🧪 Enviando publicações manualmente...")
 
-    await enviar_relatorio_agora()
+    await enviar_relatorio_agora(for ativo in config.ATIVOS:
+    try:
+        dados[ativo] = market.preco_atual(ativo)
+    except Exception as e:
+        await log_bot(
+            "Validação de ativo",
+            f"Ativo `{ativo}` ignorado.\nMotivo: {str(e)}",
+            tipo="AVISO"
+        )
     await enviar_jornal_agora()
 
     await ctx.send("✅ Relatório e jornal enviados com sucesso.")
