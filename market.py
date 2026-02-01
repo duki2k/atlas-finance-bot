@@ -8,13 +8,13 @@ import time
 CRYPTO_MAP = {
     "BTC-USD": "bitcoin",
     "ETH-USD": "ethereum",
-    "SOL-USD": "solana",
     "USDT-USD": "tether",
     "BNB-USD": "binancecoin",
     "XRP-USD": "ripple",
     "ADA-USD": "cardano",
     "SOL-USD": "solana"
 }
+
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 
