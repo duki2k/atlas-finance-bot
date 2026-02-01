@@ -1,5 +1,5 @@
 ATIVOS = [
-    "BTC-USD","ETH-USD","USDT-USD","BNB-USD","XRP-USD","ADA-USD",
+    "BTC-USD","ETH-USD","SOL-USD","USDT-USD","BNB-USD","XRP-USD","ADA-USD",
     "AAPL","MSFT","AMZN","GOOGL","TSLA","NVDA","META","BRK-B",
     "JPM","V","MA","UNH","DIS","PG","KO","PEP","INTC","CSCO",
     "XOM","CVX","BAC","WMT","HD","VZ","ADBE"
