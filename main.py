@@ -25,7 +25,7 @@ bot = commands.Bot(
 )
 
 # ─────────────────────────────
-# MAPA DE ATIVOS (NOME + TIPO)
+# MAPA DE ATIVOS
 # ─────────────────────────────
 
 ATIVOS_INFO = {
@@ -37,34 +37,19 @@ ATIVOS_INFO = {
     "NVDA": ("NVIDIA Corporation", "Ação EUA"),
     "META": ("Meta Platforms Inc.", "Ação EUA"),
     "BRK-B": ("Berkshire Hathaway Inc.", "Ação EUA"),
-    "JPM": ("JPMorgan Chase & Co.", "Ação EUA"),
-    "V": ("Visa Inc.", "Ação EUA"),
-    "MA": ("Mastercard Incorporated", "Ação EUA"),
-    "UNH": ("UnitedHealth Group", "Ação EUA"),
-    "DIS": ("Walt Disney Company", "Ação EUA"),
-    "PG": ("Procter & Gamble", "Ação EUA"),
-    "KO": ("Coca-Cola Company", "Ação EUA"),
-    "PEP": ("PepsiCo Inc.", "Ação EUA"),
-    "INTC": ("Intel Corporation", "Ação EUA"),
-    "CSCO": ("Cisco Systems", "Ação EUA"),
-    "XOM": ("Exxon Mobil", "Ação EUA"),
-    "CVX": ("Chevron Corporation", "Ação EUA"),
-    "BAC": ("Bank of America", "Ação EUA"),
-    "WMT": ("Walmart Inc.", "Ação EUA"),
-    "HD": ("Home Depot Inc.", "Ação EUA"),
-    "VZ": ("Verizon Communications", "Ação EUA"),
-    "ADBE": ("Adobe Inc.", "Ação EUA"),
     "BTC-USD": ("Bitcoin", "Criptomoeda"),
     "ETH-USD": ("Ethereum", "Criptomoeda"),
-    "USDT-USD": ("Tether", "Criptomoeda"),
-    "BNB-USD": ("Binance Coin", "Criptomoeda"),
-    "XRP-USD": ("XRP", "Criptomoeda"),
     "ADA-USD": ("Cardano", "Criptomoeda"),
+    "XRP-USD": ("XRP", "Criptomoeda"),
+    "BNB-USD": ("Binance Coin", "Criptomoeda"),
 }
 
 # ─────────────────────────────
-# UTILIDADES
+# FUNÇÕES AUXILIARES
 # ─────────────────────────────
+
+def admin_channel_only(ctx):
+    return config.CANAL_ADMIN and ctx.channel.id == config.CANAL_ADMIN
 
 def dolar_para_real():
     try:
@@ -78,20 +63,20 @@ def dolar_para_real():
 
 def sentimento_mercado(noticias):
     texto = " ".join(noticias).lower()
-    positivas = ["alta", "sobe", "ganho", "avanço", "recuperação", "otimismo"]
-    negativas = ["queda", "cai", "crise", "tensão", "volatilidade", "inflação"]
+    positivas = ["alta", "sobe", "ganho", "avanço", "recuperação"]
+    negativas = ["queda", "cai", "crise", "volatilidade", "tensão"]
 
     score = sum(p in texto for p in positivas) - sum(n in texto for n in negativas)
 
     if score >= 2:
-        return "🟢 Sentimento positivo — mercado construtivo"
+        return "🟢 Sentimento positivo"
     elif score <= -2:
-        return "🔴 Sentimento defensivo — cautela recomendada"
-    return "🟡 Sentimento neutro — mercado indefinido"
+        return "🔴 Sentimento defensivo"
+    return "🟡 Sentimento neutro"
 
 def embed_ativo(ativo, usd, brl):
     nome, tipo = ATIVOS_INFO.get(ativo, (ativo, "Ativo Financeiro"))
-    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y às %H:%M")
+    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
 
     embed = discord.Embed(
         title=f"📊 {nome}",
@@ -102,11 +87,6 @@ def embed_ativo(ativo, usd, brl):
     embed.add_field(name="🇧🇷 BRL", value=f"R$ {brl:,.2f}", inline=True)
     embed.set_footer(text=f"Atualizado em {agora}")
     return embed
-
-def admin_channel_only(ctx):
-    if not config.CANAL_ADMIN:
-        return False
-    return ctx.channel.id == config.CANAL_ADMIN
 
 # ─────────────────────────────
 # EVENTO READY
@@ -141,6 +121,27 @@ async def help(ctx):
     )
 
     embed.add_field(
+        name="⚙️ Configuração",
+        value=(
+            "`!setcanal`\n"
+            "`!setcanalnoticias`\n"
+            "`!setcanaladmin`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧪 Testes",
+        value=(
+            "`!testenoticias`\n"
+            "`!testarpublicacoes`\n"
+            "`!statusbot`\n"
+            "`!manutencao`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
         name="📊 Automático",
         value=(
             "• Relatório diário de ativos (06h)\n"
@@ -150,27 +151,6 @@ async def help(ctx):
         inline=False
     )
 
-    embed.add_field(
-        name="🧪 Testes / Manutenção",
-        value=(
-            "`!testenoticias`\n"
-            "`!manutencao`\n"
-            "`!statusbot`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🔒 Configuração",
-        value=(
-            "`!setcanal`\n"
-            "`!setcanalnoticias`\n"
-            "`!setcanaladmin`"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text="Acesso restrito • Administradores")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -189,7 +169,7 @@ async def setcanalnoticias(ctx):
 @commands.has_permissions(administrator=True)
 async def setcanaladmin(ctx):
     config.CANAL_ADMIN = ctx.channel.id
-    await ctx.send("🔒 Canal administrativo definido")
+    await ctx.send("🔒 Canal admin definido")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -211,6 +191,31 @@ async def testenoticias(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
+async def testarpublicacoes(ctx):
+    if not admin_channel_only(ctx):
+        return
+
+    await ctx.send("🧪 Disparo manual iniciado")
+    await analise_diaria()
+    await noticias_diarias()
+    await ctx.send("✅ Publicações enviadas")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def statusbot(ctx):
+    if not admin_channel_only(ctx):
+        return
+
+    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+
+    embed = discord.Embed(title="📡 Status do Bot", color=0x2ECC71)
+    embed.add_field(name="Bot", value=str(bot.user), inline=False)
+    embed.add_field(name="Horário", value=agora, inline=True)
+    embed.add_field(name="Notícias", value="Ativas" if config.NEWS_ATIVAS else "Off", inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
 async def manutencao(ctx):
     if not admin_channel_only(ctx):
         return
@@ -226,22 +231,6 @@ async def manutencao(ctx):
     embed.add_field(name="Canal Análises", value="OK" if config.CANAL_ANALISE else "❌", inline=True)
     embed.add_field(name="Canal Notícias", value="OK" if config.CANAL_NOTICIAS else "❌", inline=True)
     embed.add_field(name="Canal Admin", value="OK" if config.CANAL_ADMIN else "❌", inline=True)
-
-    await ctx.send(embed=embed)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def statusbot(ctx):
-    if not admin_channel_only(ctx):
-        return
-
-    agora = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-
-    embed = discord.Embed(title="📡 Status do Bot", color=0x2ECC71)
-    embed.add_field(name="Bot", value=str(bot.user), inline=False)
-    embed.add_field(name="Horário atual", value=agora, inline=True)
-    embed.add_field(name="Notícias", value="Ativas" if config.NEWS_ATIVAS else "Desativadas", inline=True)
-
     await ctx.send(embed=embed)
 
 # ─────────────────────────────
@@ -250,6 +239,8 @@ async def statusbot(ctx):
 
 @tasks.loop(time=time(hour=6, minute=0, tzinfo=BR_TZ))
 async def analise_diaria():
+    print("📊 Executando analise_diaria")
+
     if not config.CANAL_ANALISE:
         return
 
@@ -262,8 +253,7 @@ async def analise_diaria():
         try:
             usd = market.preco_atual(ativo)
             brl = usd * cotacao
-            embed = embed_ativo(ativo, usd, brl)
-            await canal.send(embed=embed)
+            await canal.send(embed=embed_ativo(ativo, usd, brl))
         except:
             pass
 
@@ -272,6 +262,8 @@ async def analise_diaria():
     time(hour=18, minute=0, tzinfo=BR_TZ)
 ])
 async def noticias_diarias():
+    print("📰 Executando noticias_diarias")
+
     if not config.NEWS_ATIVAS or not config.CANAL_NOTICIAS:
         return
 
@@ -292,14 +284,17 @@ async def noticias_diarias():
         inline=False
     )
 
-    embed.set_footer(text="Conteúdo educacional • Atlas Community")
+    embed.set_footer(text="Atlas Community • Conteúdo educacional")
     await canal.send(embed=embed)
 
 @tasks.loop(time=time(hour=18, minute=0, tzinfo=BR_TZ))
 async def resumo_semanal():
+    print("📅 Executando resumo_semanal")
+
     hoje = datetime.now(BR_TZ)
     if hoje.weekday() != 4:
         return
+
     if not config.CANAL_NOTICIAS:
         return
 
@@ -324,15 +319,33 @@ async def resumo_semanal():
     embed.add_field(
         name="🧠 Leitura do Bot",
         value=(
-            "• Avaliar posições abertas\n"
+            "• Avaliar posições\n"
             "• Reduzir exposição excessiva\n"
-            "• Planejar próxima semana com cautela"
+            "• Planejar próxima semana"
         ),
         inline=False
     )
 
-    embed.set_footer(text="Resumo Semanal")
     await canal.send(embed=embed)
+
+# ─────────────────────────────
+# BEFORE LOOP (OBRIGATÓRIO)
+# ─────────────────────────────
+
+@analise_diaria.before_loop
+async def before_analise():
+    await bot.wait_until_ready()
+    print("📊 analise_diaria pronta")
+
+@noticias_diarias.before_loop
+async def before_noticias():
+    await bot.wait_until_ready()
+    print("📰 noticias_diarias pronta")
+
+@resumo_semanal.before_loop
+async def before_resumo():
+    await bot.wait_until_ready()
+    print("📅 resumo_semanal pronta")
 
 # ─────────────────────────────
 # START
