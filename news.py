@@ -9,6 +9,17 @@ RSS_URL = (
 def noticias():
     try:
         feed = feedparser.parse(RSS_URL)
-        return [e.title for e in feed.entries[:8]]
-    except:
+
+        if not getattr(feed, "entries", None):
+            return []
+
+        titulos = []
+        for entry in feed.entries[:10]:
+            t = getattr(entry, "title", "")
+            if t:
+                titulos.append(t.strip())
+
+        return titulos
+
+    except Exception:
         return []
