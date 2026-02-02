@@ -1,6 +1,8 @@
 # market.py
+import asyncio
 import time
-import requests
+import random
+import aiohttp
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -14,26 +16,22 @@ CRYPTO_MAP = {
     "AVAX-USD": "avalanche-2",
     "DOT-USD": "polkadot",
     "LINK-USD": "chainlink",
-    # ✅ MATIC corrigido
     "MATIC-USD": "polygon-pos",
 }
 
+# Sessão HTTP injetada pelo main.py
+_SESSION: aiohttp.ClientSession | None = None
+
 _crypto_cache = {}
-_crypto_cache_time = 0
+_crypto_cache_time = 0.0
 _last_good = {}  # {ativo: (preco, variacao, timestamp)}
+
+def set_session(session: aiohttp.ClientSession):
+    global _SESSION
+    _SESSION = session
 
 def eh_fii(ativo: str) -> bool:
     return ativo.endswith("11.SA")
-
-def _http_get_json(url, *, params=None, headers=None, timeout=12, retries=2):
-    for i in range(retries + 1):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            time.sleep(0.35 * (i + 1))
-    return {}
 
 def _store_cache(ativo, preco, variacao):
     if preco is None or variacao is None:
@@ -70,35 +68,56 @@ def _last_two_valid(nums):
             return vals[0], vals[1]
     return None, None
 
+async def _http_get_json(url, *, params=None, headers=None, timeout=12, retries=2):
+    """
+    GET assíncrono com retry + backoff curto.
+    """
+    if _SESSION is None:
+        raise RuntimeError("market.py: session não foi configurada. Chame market.set_session() no main.py")
+
+    headers = headers or HEADERS
+
+    for i in range(retries + 1):
+        try:
+            async with _SESSION.get(url, params=params, headers=headers, timeout=timeout) as r:
+                r.raise_for_status()
+                return await r.json()
+        except Exception:
+            # backoff exponencial curto + jitter
+            if i >= retries:
+                break
+            await asyncio.sleep((0.25 * (2 ** i)) + random.uniform(0.0, 0.15))
+    return {}
+
 # ───────────── CRIPTO (lote + fallback unitário) ─────────────
 
-def _atualizar_cache_crypto():
+async def _atualizar_cache_crypto():
     global _crypto_cache, _crypto_cache_time
 
     ids = ",".join(CRYPTO_MAP.values())
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
 
-    data = _http_get_json(url, params=params, timeout=15, retries=2)
+    data = await _http_get_json(url, params=params, timeout=15, retries=2)
     if isinstance(data, dict) and data:
         _crypto_cache = data
         _crypto_cache_time = time.time()
 
-def dados_crypto(ativo):
+async def dados_crypto(ativo: str):
     coin = CRYPTO_MAP.get(ativo)
     if not coin:
         return None, None
 
     if time.time() - _crypto_cache_time > 60:
-        _atualizar_cache_crypto()
+        await _atualizar_cache_crypto()
 
     d = _crypto_cache.get(coin)
 
     if not d:
-        # fallback: busca só essa moeda uma vez
+        # fallback unitário
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {"ids": coin, "vs_currencies": "usd", "include_24hr_change": "true"}
-        one = _http_get_json(url, params=params, timeout=12, retries=1)
+        one = await _http_get_json(url, params=params, timeout=12, retries=1)
         dd = one.get(coin)
         if dd and dd.get("usd") is not None and dd.get("usd_24h_change") is not None:
             preco = float(dd["usd"])
@@ -119,101 +138,92 @@ def dados_crypto(ativo):
 
 # ───────────── AÇÕES/ETFs (Yahoo Quote → Chart → Stooq → Cache) ─────────────
 
-def dados_acao_yahoo_quote(ativo):
-    try:
-        url = "https://query1.finance.yahoo.com/v7/finance/quote"
-        params = {"symbols": ativo}
-        j = _http_get_json(url, params=params, headers=HEADERS, timeout=12, retries=2)
+async def dados_acao_yahoo_quote(ativo: str):
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ativo}
+    j = await _http_get_json(url, params=params, headers=HEADERS, timeout=12, retries=2)
 
-        res = j.get("quoteResponse", {}).get("result", [])
-        if not res:
-            return None, None
-
-        q = res[0]
-        price = q.get("regularMarketPrice")
-        prev = q.get("regularMarketPreviousClose")
-        if price is None or prev is None:
-            return None, None
-
-        price = float(price)
-        prev = float(prev)
-        var = _pct_change(price, prev)
-        if var is None:
-            return None, None
-        return price, float(var)
-
-    except Exception:
+    res = j.get("quoteResponse", {}).get("result", [])
+    if not res:
         return None, None
 
-def dados_acao_yahoo_chart(ativo):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ativo}"
-        params = {"range": "5d", "interval": "1d"}
-        r = _http_get_json(url, params=params, headers=HEADERS, timeout=12, retries=2)
-
-        result = r.get("chart", {}).get("result")
-        if not result:
-            return None, None
-
-        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
-        closes = quote.get("close", [])
-        last, prev = _last_two_valid(closes)
-
-        var = _pct_change(last, prev)
-        if last is None or var is None:
-            return None, None
-        return float(last), float(var)
-
-    except Exception:
+    q = res[0]
+    price = q.get("regularMarketPrice")
+    prev = q.get("regularMarketPreviousClose")
+    if price is None or prev is None:
         return None, None
 
-def dados_acao_stooq(ativo):
+    price = float(price)
+    prev = float(prev)
+    var = _pct_change(price, prev)
+    if var is None:
+        return None, None
+    return price, float(var)
+
+async def dados_acao_yahoo_chart(ativo: str):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ativo}"
+    params = {"range": "5d", "interval": "1d"}
+    r = await _http_get_json(url, params=params, headers=HEADERS, timeout=12, retries=2)
+
+    result = r.get("chart", {}).get("result")
+    if not result:
+        return None, None
+
+    quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+    closes = quote.get("close", [])
+    last, prev = _last_two_valid(closes)
+
+    var = _pct_change(last, prev)
+    if last is None or var is None:
+        return None, None
+    return float(last), float(var)
+
+async def dados_acao_stooq(ativo: str):
+    s = ativo.lower()
+    if s.endswith(".sa"):
+        s = s.replace(".sa", ".br")
+    elif not s.endswith(".us"):
+        s += ".us"
+
+    url = f"https://stooq.com/q/l/?s={s}&f=sd2t2ohlcv&h&e=json"
+    j = await _http_get_json(url, timeout=12, retries=2)
+
+    data = j.get("data")
+    if not data:
+        return None, None
+
+    d = data[0]
     try:
-        s = ativo.lower()
-        if s.endswith(".sa"):
-            s = s.replace(".sa", ".br")
-        elif not s.endswith(".us"):
-            s += ".us"
-
-        url = f"https://stooq.com/q/l/?s={s}&f=sd2t2ohlcv&h&e=json"
-        j = _http_get_json(url, timeout=12, retries=2)
-
-        data = j.get("data")
-        if not data:
-            return None, None
-
-        d = data[0]
         close = float(d.get("close"))
         open_ = float(d.get("open"))
-        if open_ <= 0 or close <= 0:
-            return None, None
-
-        var = ((close - open_) / open_) * 100.0
-        return float(close), float(var)
-
     except Exception:
         return None, None
 
-def dados_ativo(ativo):
+    if open_ <= 0 or close <= 0:
+        return None, None
+
+    var = ((close - open_) / open_) * 100.0
+    return float(close), float(var)
+
+async def dados_ativo(ativo: str):
     # Cripto
     if ativo.endswith("-USD"):
-        return dados_crypto(ativo)
+        return await dados_crypto(ativo)
 
     # Yahoo Quote
-    p, v = dados_acao_yahoo_quote(ativo)
+    p, v = await dados_acao_yahoo_quote(ativo)
     if p is not None and v is not None:
         _store_cache(ativo, p, v)
         return p, v
 
     # Yahoo Chart
-    p, v = dados_acao_yahoo_chart(ativo)
+    p, v = await dados_acao_yahoo_chart(ativo)
     if p is not None and v is not None:
         _store_cache(ativo, p, v)
         return p, v
 
     # Stooq
-    time.sleep(0.2)
-    p, v = dados_acao_stooq(ativo)
+    p, v = await dados_acao_stooq(ativo)
     if p is not None and v is not None:
         _store_cache(ativo, p, v)
         return p, v
@@ -223,7 +233,7 @@ def dados_ativo(ativo):
     if p is not None and v is not None:
         return p, v
 
-    # FII: se não tiver dado, não quebra (var neutra)
+    # FII: não quebra
     if eh_fii(ativo):
         return None, 0.0
 
