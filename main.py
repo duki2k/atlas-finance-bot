@@ -33,7 +33,7 @@ HTTP = None  # aiohttp.ClientSession
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
-# Locks anti-overlap (evita execuções simultâneas)
+# Locks anti-overlap
 PUBLICACAO_LOCK = asyncio.Lock()
 
 # Concorrência de coleta (ajuste via env no Railway: MAX_CONCURRENCY=6/8/10)
@@ -98,14 +98,9 @@ async def log_bot(titulo: str, mensagem: str):
     await canal.send(embed=embed)
 
 async def dolar_para_real_async() -> float:
-    """
-    FX USD->BRL com TTL para evitar bater sempre.
-    """
     global _FX_CACHE, HTTP
-
     now = asyncio.get_event_loop().time()
 
-    # cache válido?
     if (now - _FX_CACHE["ts"]) < _FX_TTL and _FX_CACHE["rate"] > 0:
         return float(_FX_CACHE["rate"])
 
@@ -167,9 +162,6 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 # ─────────────────────────────
 
 async def _fetch_one(categoria: str, ativo: str):
-    """
-    Busca 1 ativo com semáforo (limite de concorrência) + tratamento de falhas.
-    """
     async with SEM:
         try:
             p, v = await market.dados_ativo(ativo)
@@ -179,7 +171,6 @@ async def _fetch_one(categoria: str, ativo: str):
                 return None
 
             if p is None or v is None:
-                # reduz spam: só loga se falhar 3 vezes seguidas
                 FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
                 if FALHAS_SEGUIDAS[ativo] >= 3:
                     await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
@@ -187,10 +178,7 @@ async def _fetch_one(categoria: str, ativo: str):
                 return None
 
             FALHAS_SEGUIDAS[ativo] = 0
-
-            # alerta de rompimento
             await alerta_rompimento(ativo, float(p), categoria)
-
             return (ativo, float(p), float(v))
 
         except Exception as e:
@@ -198,16 +186,12 @@ async def _fetch_one(categoria: str, ativo: str):
             return None
 
 async def coletar_dados():
-    """
-    Coleta TODOS os ativos em paralelo (com limite de concorrência).
-    """
     tasks_list = []
     for categoria, ativos in config.ATIVOS.items():
         for ativo in ativos:
             tasks_list.append((_fetch_one(categoria, ativo), categoria))
 
-    coros = [c for c, _ in tasks_list]
-    results = await asyncio.gather(*coros, return_exceptions=False)
+    results = await asyncio.gather(*[c for c, _ in tasks_list], return_exceptions=False)
 
     dados = {}
     idx = 0
@@ -344,7 +328,6 @@ def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
 # ─────────────────────────────
 
 async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jornal_id=None, enviar_tg=True):
-    # anti-overlap: se já tem execução em andamento, não entra
     if PUBLICACAO_LOCK.locked():
         await log_bot("Scheduler", "Ignorado: já existe uma execução em andamento (anti-overlap).")
         return
@@ -380,7 +363,7 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
 
 
 # ─────────────────────────────
-# COMANDOS (ADMIN ONLY)
+# EVENTOS / COMANDOS
 # ─────────────────────────────
 
 @bot.event
@@ -388,13 +371,11 @@ async def on_ready():
     global HTTP
     print(f"🤖 Conectado como {bot.user}")
 
-    # cria sessão HTTP única
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
         connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300)
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-        # injeta sessão pros módulos async
         market.set_session(HTTP)
         news.set_session(HTTP)
         telegram.set_session(HTTP)
@@ -403,18 +384,41 @@ async def on_ready():
         scheduler.start()
 
 @bot.event
+async def on_message(message: discord.Message):
+    """
+    Discord NÃO sugere comandos automaticamente para prefixo '!'.
+    Então: se você ENVIAR apenas '!', o bot responde com a lista de comandos.
+    """
+    if message.author.bot:
+        return
+
+    if message.content.strip() == "!":
+        if message.guild and message.author.guild_permissions.administrator:
+            ctx = await bot.get_context(message)
+            await comandos(ctx)
+        else:
+            try:
+                await message.channel.send("❌ Você não tem permissão para ver os comandos.")
+            except Exception:
+                pass
+        return
+
+    await bot.process_commands(message)
+
+@bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Você não tem permissão para usar este comando.")
         return
     await log_bot("Erro em comando", str(error))
 
-@bot.command(name="comandos")
+
+@bot.command(name="comandos", aliases=["help", "ajuda"])
 @commands.has_permissions(administrator=True)
 async def comandos(ctx):
     embed = discord.Embed(
         title="🤖 Atlas Finance — Comandos (Admin)",
-        description="Testes separados por canal + Telegram",
+        description="Digite `!` (apenas !) para ver este menu rapidamente ✅",
         color=0x5865F2
     )
     embed.add_field(
