@@ -1,6 +1,6 @@
 import requests
 
-# ───── CRIPTOS (CoinGecko) ─────
+# ───── MAPA CRIPTOS (CoinGecko) ─────
 
 CRYPTO_MAP = {
     "BTC-USD": "bitcoin",
@@ -10,6 +10,8 @@ CRYPTO_MAP = {
     "XRP-USD": "ripple",
     "BNB-USD": "binancecoin"
 }
+
+# ───── CRIPTOS ─────
 
 def preco_crypto(ativo):
     coin = CRYPTO_MAP.get(ativo)
@@ -24,11 +26,7 @@ def preco_crypto(ativo):
     }
 
     r = requests.get(url, params=params, timeout=10).json()
-    preco = r[coin]["usd"]
-    variacao = r[coin]["usd_24h_change"]
-
-    return preco, variacao
-
+    return r[coin]["usd"], r[coin]["usd_24h_change"]
 
 # ───── AÇÕES (Yahoo Finance) ─────
 
@@ -42,12 +40,10 @@ def preco_acao(ativo):
         quote = r["chart"]["result"][0]
         close = quote["indicators"]["quote"][0]["close"][0]
         open_ = quote["indicators"]["quote"][0]["open"][0]
-
         variacao = ((close - open_) / open_) * 100
         return close, variacao
     except:
         return None, None
-
 
 # ───── FUNÇÃO PRINCIPAL ─────
 
