@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/telegram.py b/telegram.py
 index 48ea3a3e8a4f5fb58d63b7de370c84d08063baca..3897e32d5e2fa832835d78f5c1d870613d078e53 100644
 --- a/telegram.py
@@ -25,6 +24,3 @@ index 48ea3a3e8a4f5fb58d63b7de370c84d08063baca..3897e32d5e2fa832835d78f5c1d87061
  
      r = requests.post(url, json=payload, timeout=10)
      return r.status_code == 200
- 
-EOF
-)
