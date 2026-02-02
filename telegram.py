@@ -1,18 +1,21 @@
-import requests
+# telegram.py
 import os
+import requests
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def enviar_telegram(texto):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def enviar_telegram(mensagem: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": texto
-    }
-
-    r = requests.post(url, json=payload, timeout=10)
-    return r.status_code == 200
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": mensagem
+        }
+        r = requests.post(url, json=payload, timeout=12)
+        return r.status_code == 200
+    except Exception:
+        return False
