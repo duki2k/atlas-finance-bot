@@ -16,5 +16,8 @@ def enviar_telegram(texto):
         "disable_web_page_preview": True,
     }
 
-    r = requests.post(url, json=payload, timeout=10)
-    return r.status_code == 200
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
