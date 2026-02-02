@@ -17,7 +17,7 @@ CRYPTO_MAP = {
     "AVAX-USD": "avalanche-2",
     "DOT-USD": "polkadot",
     "LINK-USD": "chainlink",
-    "MATIC-USD": "matic-network",
+    "MATIC-USD": "polygon-pos",
 }
 
 _crypto_cache = {}
