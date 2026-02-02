@@ -2,7 +2,7 @@
 import asyncio
 import random
 import time
-import aiohttp
+import aiohttp==3.9.5
 import feedparser
 
 RSS_URL = (
