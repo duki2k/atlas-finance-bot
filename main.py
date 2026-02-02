@@ -2,8 +2,8 @@
 import os
 import asyncio
 import discord
-import requests
 import pytz
+import aiohttp
 from datetime import datetime
 from discord.ext import commands, tasks
 
@@ -27,6 +27,18 @@ ultima_tarde = None
 # Rompimento
 ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
+
+# HTTP session + cache FX
+HTTP: aiohttp.ClientSession | None = None
+_FX_CACHE = {"rate": 5.0, "ts": 0.0}
+_FX_TTL = 600  # 10 min
+
+# Locks anti-overlap
+PUBLICACAO_LOCK = asyncio.Lock()
+
+# Concorrência global de coleta (ajuste fino)
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
+SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
 
 # ─────────────────────────────
@@ -77,18 +89,6 @@ def ideias_em_baixa() -> str:
         "• Evite decisões por impulso"
     )
 
-def dolar_para_real() -> float:
-    try:
-        r = requests.get(
-            "https://api.exchangerate.host/latest?base=USD&symbols=BRL",
-            timeout=10
-        )
-        data = r.json()
-        rate = data.get("rates", {}).get("BRL")
-        return float(rate) if rate else 5.0
-    except Exception:
-        return 5.0
-
 async def log_bot(titulo: str, mensagem: str):
     canal = bot.get_channel(config.CANAL_LOGS)
     if not canal:
@@ -96,6 +96,34 @@ async def log_bot(titulo: str, mensagem: str):
     embed = discord.Embed(title=f"📋 {titulo}", description=mensagem, color=0xE67E22)
     embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
+
+async def dolar_para_real_async() -> float:
+    """
+    FX USD->BRL com TTL pra evitar bater sempre.
+    """
+    global _FX_CACHE, HTTP
+    now = asyncio.get_event_loop().time()
+
+    # cache válido?
+    if (now - _FX_CACHE["ts"]) < _FX_TTL and _FX_CACHE["rate"] > 0:
+        return float(_FX_CACHE["rate"])
+
+    if HTTP is None:
+        return 5.0
+
+    url = "https://api.exchangerate.host/latest"
+    params = {"base": "USD", "symbols": "BRL"}
+
+    try:
+        async with HTTP.get(url, params=params, timeout=10) as r:
+            r.raise_for_status()
+            data = await r.json()
+            rate = data.get("rates", {}).get("BRL")
+            rate = float(rate) if rate else 5.0
+            _FX_CACHE = {"rate": rate, "ts": now}
+            return rate
+    except Exception:
+        return float(_FX_CACHE.get("rate") or 5.0)
 
 
 # ─────────────────────────────
@@ -134,51 +162,66 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
 
 # ─────────────────────────────
-# COLETA EM LOTES
+# COLETA CONCORRENTE (🔥 GRANDE MELHORIA)
 # ─────────────────────────────
 
-async def coletar_lote(categoria: str, ativos: list[str], delay: float = 0.35):
-    itens = []
-
-    for ativo in ativos:
+async def _fetch_one(categoria: str, ativo: str):
+    """
+    Busca 1 ativo com semáforo (limite de concorrência) + tratamento de falhas.
+    """
+    async with SEM:
         try:
-            p, v = market.dados_ativo(ativo)
+            p, v = await market.dados_ativo(ativo)
 
-            # FIIs: se preço não veio, não loga, só pula
+            # FIIs: se preço não veio, não loga, só ignora
             if ativo.endswith("11.SA") and p is None:
-                await asyncio.sleep(delay)
-                continue
+                return None
 
             if p is None or v is None:
-                # reduz spam: só loga se falhar 3 vezes seguidas
                 FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
                 if FALHAS_SEGUIDAS[ativo] >= 3:
                     await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
                     FALHAS_SEGUIDAS[ativo] = 0
-                await asyncio.sleep(delay)
-                continue
+                return None
 
             FALHAS_SEGUIDAS[ativo] = 0
-            itens.append((ativo, p, v))
 
-            await alerta_rompimento(ativo, p, categoria)
+            # alerta de rompimento (não bloqueia coleta geral)
+            await alerta_rompimento(ativo, float(p), categoria)
+
+            return (ativo, float(p), float(v))
 
         except Exception as e:
             await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{e}")
-
-        await asyncio.sleep(delay)
-
-    return itens
+            return None
 
 async def coletar_dados():
-    dados = {}
-    total = 0
-
+    """
+    Coleta TODOS os ativos em paralelo (com limite de concorrência).
+    """
+    tasks_list = []
     for categoria, ativos in config.ATIVOS.items():
-        lote = await coletar_lote(categoria, ativos)
-        if lote:
-            dados[categoria] = lote
-            total += len(lote)
+        for ativo in ativos:
+            tasks_list.append((_fetch_one(categoria, ativo), categoria))
+
+    # dispara tudo
+    coros = [c for c, _ in tasks_list]
+    results = await asyncio.gather(*coros, return_exceptions=False)
+
+    # reorganiza por categoria mantendo só válidos
+    dados = {}
+    idx = 0
+    total = 0
+    for categoria, ativos in config.ATIVOS.items():
+        itens = []
+        for _ in ativos:
+            item = results[idx]
+            idx += 1
+            if item:
+                itens.append(item)
+        if itens:
+            dados[categoria] = itens
+            total += len(itens)
 
     if total == 0:
         await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
@@ -192,10 +235,7 @@ async def coletar_dados():
 # ─────────────────────────────
 
 def embed_relatorio(dados: dict, cot: float):
-    moves = []
-    for categoria, itens in dados.items():
-        for ativo, preco, var in itens:
-            moves.append((ativo, preco, var))
+    moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
 
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
@@ -222,11 +262,10 @@ def embed_relatorio(dados: dict, cot: float):
     )
 
     for categoria, itens in dados.items():
-        linhas = []
-        for ativo, preco, var in itens:
-            linhas.append(
-                f"• `{ativo}` {emoji_var(var)} **{var:.2f}%**  |  💲 {preco:,.2f}  |  🇧🇷 R$ {(preco*cot):,.2f}"
-            )
+        linhas = [
+            f"• `{ativo}` {emoji_var(var)} **{var:.2f}%**  |  💲 {preco:,.2f}  |  🇧🇷 R$ {(preco*cot):,.2f}"
+            for (ativo, preco, var) in itens
+        ]
         embed.add_field(name=categoria, value="\n".join(linhas), inline=False)
 
     embed.add_field(name="💡 Dica do dia", value=ideias_em_baixa(), inline=False)
@@ -250,7 +289,6 @@ def embed_jornal(manchetes: list[str], periodo: str):
         embed.set_footer(text="Fonte: Google News RSS")
         return embed
 
-    # separação em blocos (mais “jornal”)
     bloco1 = "\n".join([f"📰 **{i}.** {m}" for i, m in enumerate(manchetes[:5], start=1)])
     bloco2 = "\n".join([f"🗞️ **{i}.** {m}" for i, m in enumerate(manchetes[5:10], start=6)])
 
@@ -268,10 +306,7 @@ def embed_jornal(manchetes: list[str], periodo: str):
 
 
 def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
-    moves = []
-    for categoria, itens in dados.items():
-        for ativo, preco, var in itens:
-            moves.append((ativo, preco, var))
+    moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
 
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
@@ -306,46 +341,61 @@ def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
 
 
 # ─────────────────────────────
-# PUBLICAÇÕES
+# PUBLICAÇÕES (COM LOCK)
 # ─────────────────────────────
 
 async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jornal_id=None, enviar_tg=True):
-    dados = await coletar_dados()
-    if not dados:
+    # anti-overlap: se já tem uma execução rolando, não entra
+    if PUBLICACAO_LOCK.locked():
+        await log_bot("Scheduler", "Ignorado: já existe uma execução em andamento (anti-overlap).")
         return
 
-    cot = dolar_para_real()
-    manchetes = news.noticias()
+    async with PUBLICACAO_LOCK:
+        dados = await coletar_dados()
+        if not dados:
+            return
 
-    canal_rel = bot.get_channel(canal_relatorio_id or config.CANAL_ANALISE)
-    canal_j = bot.get_channel(canal_jornal_id or config.CANAL_NOTICIAS)
+        cot = await dolar_para_real_async()
+        manchetes = news.noticias()
 
-    if canal_rel:
-        await canal_rel.send(embed=embed_relatorio(dados, cot))
-    else:
-        await log_bot("CANAL_ANALISE inválido", "Não encontrei canal de análise.")
+        canal_rel = bot.get_channel(canal_relatorio_id or config.CANAL_ANALISE)
+        canal_j = bot.get_channel(canal_jornal_id or config.CANAL_NOTICIAS)
 
-    if canal_j and config.NEWS_ATIVAS:
-        await canal_j.send(embed=embed_jornal(manchetes, periodo))
-    else:
-        await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
+        if canal_rel:
+            await canal_rel.send(embed=embed_relatorio(dados, cot))
+        else:
+            await log_bot("CANAL_ANALISE inválido", "Não encontrei canal de análise.")
 
-    if enviar_tg:
-        ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
-        if not ok:
-            await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
+        if canal_j and config.NEWS_ATIVAS:
+            await canal_j.send(embed=embed_jornal(manchetes, periodo))
+        else:
+            await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
-    if not manchetes:
-        await log_bot("RSS vazio", "news.noticias() retornou lista vazia (pode ser temporário).")
+        if enviar_tg:
+            ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
+            if not ok:
+                await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
+
+        if not manchetes:
+            await log_bot("RSS vazio", "news.noticias() retornou lista vazia (pode ser temporário).")
 
 
 # ─────────────────────────────
-# COMANDOS (ADMIN ONLY)
+# EVENTOS / COMANDOS
 # ─────────────────────────────
 
 @bot.event
 async def on_ready():
+    global HTTP
     print(f"🤖 Conectado como {bot.user}")
+
+    # cria sessão HTTP única
+    if HTTP is None:
+        timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
+        connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300)
+        HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        market.set_session(HTTP)
+
     if not scheduler.is_running():
         scheduler.start()
 
@@ -403,7 +453,7 @@ async def testrelatorio(ctx):
     if not dados:
         await ctx.send("❌ Não consegui coletar dados.")
         return
-    cot = dolar_para_real()
+    cot = await dolar_para_real_async()
     await ctx.send(embed=embed_relatorio(dados, cot))
 
 @bot.command()
@@ -469,6 +519,11 @@ async def testarpublicacoes(ctx):
 async def reiniciar(ctx):
     await ctx.send("🔄 Reiniciando bot...")
     await asyncio.sleep(2)
+    # fecha sessão http antes de fechar o bot
+    global HTTP
+    if HTTP is not None:
+        await HTTP.close()
+        HTTP = None
     await bot.close()
 
 
