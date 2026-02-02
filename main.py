@@ -29,14 +29,14 @@ ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
 
 # HTTP session + cache FX
-HTTP: aiohttp.ClientSession | None = None
+HTTP = None  # aiohttp.ClientSession
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
-# Locks anti-overlap
+# Locks anti-overlap (evita execuções simultâneas)
 PUBLICACAO_LOCK = asyncio.Lock()
 
-# Concorrência global de coleta (ajuste fino)
+# Concorrência de coleta (ajuste via env no Railway: MAX_CONCURRENCY=6/8/10)
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -99,9 +99,10 @@ async def log_bot(titulo: str, mensagem: str):
 
 async def dolar_para_real_async() -> float:
     """
-    FX USD->BRL com TTL pra evitar bater sempre.
+    FX USD->BRL com TTL para evitar bater sempre.
     """
     global _FX_CACHE, HTTP
+
     now = asyncio.get_event_loop().time()
 
     # cache válido?
@@ -109,7 +110,7 @@ async def dolar_para_real_async() -> float:
         return float(_FX_CACHE["rate"])
 
     if HTTP is None:
-        return 5.0
+        return float(_FX_CACHE.get("rate") or 5.0)
 
     url = "https://api.exchangerate.host/latest"
     params = {"base": "USD", "symbols": "BRL"}
@@ -162,7 +163,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
 
 # ─────────────────────────────
-# COLETA CONCORRENTE (🔥 GRANDE MELHORIA)
+# COLETA CONCORRENTE
 # ─────────────────────────────
 
 async def _fetch_one(categoria: str, ativo: str):
@@ -178,6 +179,7 @@ async def _fetch_one(categoria: str, ativo: str):
                 return None
 
             if p is None or v is None:
+                # reduz spam: só loga se falhar 3 vezes seguidas
                 FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
                 if FALHAS_SEGUIDAS[ativo] >= 3:
                     await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
@@ -186,7 +188,7 @@ async def _fetch_one(categoria: str, ativo: str):
 
             FALHAS_SEGUIDAS[ativo] = 0
 
-            # alerta de rompimento (não bloqueia coleta geral)
+            # alerta de rompimento
             await alerta_rompimento(ativo, float(p), categoria)
 
             return (ativo, float(p), float(v))
@@ -204,14 +206,13 @@ async def coletar_dados():
         for ativo in ativos:
             tasks_list.append((_fetch_one(categoria, ativo), categoria))
 
-    # dispara tudo
     coros = [c for c, _ in tasks_list]
     results = await asyncio.gather(*coros, return_exceptions=False)
 
-    # reorganiza por categoria mantendo só válidos
     dados = {}
     idx = 0
     total = 0
+
     for categoria, ativos in config.ATIVOS.items():
         itens = []
         for _ in ativos:
@@ -272,7 +273,6 @@ def embed_relatorio(dados: dict, cot: float):
     embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
     return embed
 
-
 def embed_jornal(manchetes: list[str], periodo: str):
     embed = discord.Embed(
         title=f"🗞️ Jornal do Mercado — {periodo}",
@@ -303,7 +303,6 @@ def embed_jornal(manchetes: list[str], periodo: str):
     )
     embed.set_footer(text="Fonte: Google News RSS")
     return embed
-
 
 def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
     moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
@@ -345,7 +344,7 @@ def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
 # ─────────────────────────────
 
 async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jornal_id=None, enviar_tg=True):
-    # anti-overlap: se já tem uma execução rolando, não entra
+    # anti-overlap: se já tem execução em andamento, não entra
     if PUBLICACAO_LOCK.locked():
         await log_bot("Scheduler", "Ignorado: já existe uma execução em andamento (anti-overlap).")
         return
@@ -356,7 +355,7 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
             return
 
         cot = await dolar_para_real_async()
-        manchetes = news.noticias()
+        manchetes = await news.noticias()
 
         canal_rel = bot.get_channel(canal_relatorio_id or config.CANAL_ANALISE)
         canal_j = bot.get_channel(canal_jornal_id or config.CANAL_NOTICIAS)
@@ -372,7 +371,7 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg:
-            ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
+            ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
             if not ok:
                 await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
 
@@ -381,7 +380,7 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
 
 
 # ─────────────────────────────
-# EVENTOS / COMANDOS
+# COMANDOS (ADMIN ONLY)
 # ─────────────────────────────
 
 @bot.event
@@ -394,7 +393,11 @@ async def on_ready():
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
         connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300)
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+        # injeta sessão pros módulos async
         market.set_session(HTTP)
+        news.set_session(HTTP)
+        telegram.set_session(HTTP)
 
     if not scheduler.is_running():
         scheduler.start()
@@ -460,7 +463,7 @@ async def testrelatorio(ctx):
 @commands.has_permissions(administrator=True)
 async def testjornal(ctx):
     await ctx.send("🧪 Gerando jornal aqui...")
-    manchetes = news.noticias()
+    manchetes = await news.noticias()
     try:
         await ctx.send(embed=embed_jornal(manchetes, "Teste (canal atual)"))
     except discord.Forbidden:
@@ -472,7 +475,12 @@ async def testjornal(ctx):
 @commands.has_permissions(administrator=True)
 async def testtudo(ctx):
     await ctx.send("🧪 Enviando relatório + jornal neste canal (sem Telegram)...")
-    await enviar_publicacoes("Teste (canal atual)", canal_relatorio_id=ctx.channel.id, canal_jornal_id=ctx.channel.id, enviar_tg=False)
+    await enviar_publicacoes(
+        "Teste (canal atual)",
+        canal_relatorio_id=ctx.channel.id,
+        canal_jornal_id=ctx.channel.id,
+        enviar_tg=False
+    )
     await ctx.send("✅ OK")
 
 @bot.command()
@@ -483,8 +491,8 @@ async def testtelegram(ctx):
     if not dados:
         await ctx.send("❌ Não consegui coletar dados.")
         return
-    manchetes = news.noticias()
-    ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, "Teste Telegram"))
+    manchetes = await news.noticias()
+    ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, "Teste Telegram"))
     await ctx.send("✅ Telegram enviado" if ok else "❌ Falha no Telegram (token/chat_id)")
 
 @bot.command()
@@ -519,11 +527,12 @@ async def testarpublicacoes(ctx):
 async def reiniciar(ctx):
     await ctx.send("🔄 Reiniciando bot...")
     await asyncio.sleep(2)
-    # fecha sessão http antes de fechar o bot
+
     global HTTP
     if HTTP is not None:
         await HTTP.close()
         HTTP = None
+
     await bot.close()
 
 
