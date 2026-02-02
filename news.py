@@ -1,21 +1,25 @@
-# telegram.py
-import os
-import requests
+# news.py
+import feedparser
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RSS_URL = (
+    "https://news.google.com/rss/search"
+    "?q=mercado+financeiro+bolsa+mundial+economia+wall+street+juros+inflacao"
+    "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+)
 
-def enviar_telegram(mensagem: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        return False
-
+def noticias():
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": mensagem
-        }
-        r = requests.post(url, json=payload, timeout=12)
-        return r.status_code == 200
+        feed = feedparser.parse(RSS_URL)
+
+        if not getattr(feed, "entries", None):
+            return []
+
+        titulos = []
+        for entry in feed.entries[:10]:
+            t = getattr(entry, "title", "")
+            if t:
+                titulos.append(t.strip())
+
+        return titulos
     except Exception:
-        return False
+        return []
