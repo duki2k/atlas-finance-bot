@@ -2,7 +2,7 @@
 import os
 import asyncio
 import random
-import aiohttp
+import aiohttp==3.9.5
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
