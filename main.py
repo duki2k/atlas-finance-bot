@@ -10,32 +10,16 @@ from datetime import datetime
 import pytz
 import asyncio
 
-# ─────────────────────────────
-# CONFIGURAÇÕES BÁSICAS
-# ─────────────────────────────
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None
-)
-
-# ─────────────────────────────
-# CONTROLE DE HORÁRIOS
-# ─────────────────────────────
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ultimo_manha = None
 ultimo_tarde = None
-
-# ─────────────────────────────
-# MAPA DE NOMES DOS ATIVOS
-# ─────────────────────────────
 
 ATIVOS_INFO = {
     "AAPL": "Apple",
@@ -54,10 +38,6 @@ ATIVOS_INFO = {
     "BNB-USD": "Binance Coin"
 }
 
-# ─────────────────────────────
-# UTILIDADES
-# ─────────────────────────────
-
 def dolar_para_real():
     try:
         r = requests.get(
@@ -68,54 +48,38 @@ def dolar_para_real():
     except:
         return 5.0
 
-
-def sentimento_emoji(positivos, negativos):
-    if positivos > negativos:
+def sentimento_emoji(pos, neg):
+    if pos > neg:
         return "😄 Mercado positivo"
-    if negativos > positivos:
+    if neg > pos:
         return "😨 Mercado defensivo"
     return "😐 Mercado neutro"
 
-
 async def log_bot(titulo, mensagem):
     canal = bot.get_channel(config.CANAL_LOGS)
-    if not canal:
-        return
-
-    embed = discord.Embed(
-        title=f"📋 {titulo}",
-        description=mensagem,
-        color=0x3498DB
-    )
-    embed.set_footer(
-        text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-    )
-    await canal.send(embed=embed)
-
-# ─────────────────────────────
-# EMBEDS DISCORD
-# ─────────────────────────────
+    if canal:
+        embed = discord.Embed(
+            title=f"📋 {titulo}",
+            description=mensagem,
+            color=0x3498DB
+        )
+        embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
+        await canal.send(embed=embed)
 
 def embed_relatorio(dados, cotacao):
-    acoes, criptos = [], []
-    altas, quedas = [], []
+    acoes, criptos, altas, quedas = [], [], [], []
 
     for ativo, (preco, variacao) in dados.items():
         nome = ATIVOS_INFO.get(ativo, ativo)
-
         emoji = "🔼" if variacao > 0 else "🔽" if variacao < 0 else "⏺️"
-        texto_var = f"{emoji} {variacao:.2f}%"
 
         linha = (
             f"**{nome}** (`{ativo}`)\n"
-            f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco * cotacao:,.2f}\n"
-            f"📉 {texto_var}"
+            f"💲 ${preco:,.2f} | 🇧🇷 R$ {preco*cotacao:,.2f}\n"
+            f"📉 {emoji} {variacao:.2f}%"
         )
 
-        if variacao > 0:
-            altas.append((nome, variacao))
-        elif variacao < 0:
-            quedas.append((nome, variacao))
+        (altas if variacao > 0 else quedas if variacao < 0 else []).append((nome, variacao))
 
         if ativo.endswith("-USD"):
             criptos.append(linha)
@@ -126,11 +90,7 @@ def embed_relatorio(dados, cotacao):
     quedas = sorted(quedas, key=lambda x: x[1])[:3]
 
     sentimento = sentimento_emoji(len(altas), len(quedas))
-    cor = (
-        0x2ECC71 if len(altas) > len(quedas)
-        else 0xE74C3C if len(quedas) > len(altas)
-        else 0xF1C40F
-    )
+    cor = 0x2ECC71 if len(altas) > len(quedas) else 0xE74C3C if len(quedas) > len(altas) else 0xF1C40F
 
     embed = discord.Embed(
         title="📊 Relatório Diário de Ativos",
@@ -139,100 +99,42 @@ def embed_relatorio(dados, cotacao):
     )
 
     if altas:
-        embed.add_field(
-            name="🔝 Top 3 Altas",
-            value="\n".join(f"{n} (+{v:.2f}%)" for n, v in altas),
-            inline=False
-        )
-
+        embed.add_field(name="🔝 Top 3 Altas", value="\n".join(f"{n} (+{v:.2f}%)" for n,v in altas), inline=False)
     if quedas:
-        embed.add_field(
-            name="🔻 Top 3 Quedas",
-            value="\n".join(f"{n} ({v:.2f}%)" for n, v in quedas),
-            inline=False
-        )
-
+        embed.add_field(name="🔻 Top 3 Quedas", value="\n".join(f"{n} ({v:.2f}%)" for n,v in quedas), inline=False)
     if acoes:
-        embed.add_field(
-            name="📈 Ações",
-            value="\n\n".join(acoes),
-            inline=False
-        )
-
+        embed.add_field(name="📈 Ações", value="\n\n".join(acoes), inline=False)
     if criptos:
-        embed.add_field(
-            name="🪙 Criptomoedas",
-            value="\n\n".join(criptos),
-            inline=False
-        )
+        embed.add_field(name="🪙 Criptomoedas", value="\n\n".join(criptos), inline=False)
 
-    embed.set_footer(text="Dados reais do mercado • Atlas Finance")
     return embed
-
-
-def embed_jornal(noticias):
-    embed = discord.Embed(
-        title="🗞️🌍 Jornal do Mercado",
-        description="Resumo do que está movimentando o mercado hoje 🚀",
-        color=0x00BFFF
-    )
-
-    embed.add_field(
-        name="🔥 Manchetes",
-        value="\n\n".join(f"📰 {n}" for n in noticias[:6]),
-        inline=False
-    )
-
-    embed.set_footer(text="Atlas Finance")
-    return embed
-
-# ─────────────────────────────
-# TEXTO PARA TELEGRAM
-# ─────────────────────────────
 
 def gerar_texto_telegram(dados):
     altas, quedas = [], []
 
-    for ativo, (_, variacao) in dados.items():
+    for ativo, (_, v) in dados.items():
         nome = ATIVOS_INFO.get(ativo, ativo)
-        if variacao > 0:
-            altas.append((nome, variacao))
-        elif variacao < 0:
-            quedas.append((nome, variacao))
+        if v > 0:
+            altas.append((nome, v))
+        elif v < 0:
+            quedas.append((nome, v))
 
     altas = sorted(altas, key=lambda x: x[1], reverse=True)[:3]
     quedas = sorted(quedas, key=lambda x: x[1])[:3]
 
-    sentimento = sentimento_emoji(len(altas), len(quedas))
-
-    texto = f"📊 *Resumo do Mercado*\n{sentimento}\n\n"
+    texto = "📊 Resumo do Mercado\n"
+    texto += sentimento_emoji(len(altas), len(quedas)) + "\n\n"
 
     if altas:
-        texto += "🔝 *Top Altas*\n"
-        for n, v in altas:
-            texto += f"• {n}: +{v:.2f}%\n"
-        texto += "\n"
+        texto += "🔝 Top Altas\n"
+        texto += "\n".join(f"• {n}: +{v:.2f}%" for n,v in altas) + "\n\n"
 
     if quedas:
-        texto += "🔻 *Top Quedas*\n"
-        for n, v in quedas:
-            texto += f"• {n}: {v:.2f}%\n"
-        texto += "\n"
+        texto += "🔻 Top Quedas\n"
+        texto += "\n".join(f"• {n}: {v:.2f}%" for n,v in quedas) + "\n\n"
 
-    texto += "🧠 *Postura do dia*\n"
-    if len(altas) > len(quedas):
-        texto += "Cenário favorável, mas com gestão de risco.\n"
-    elif len(quedas) > len(altas):
-        texto += "Cautela. Priorize proteção de capital.\n"
-    else:
-        texto += "Mercado lateral. Seja seletivo.\n"
-
-    texto += "\n— Atlas Finance"
+    texto += "— Atlas Finance"
     return texto
-
-# ─────────────────────────────
-# ENVIO DE CONTEÚDO
-# ─────────────────────────────
 
 async def enviar_relatorio():
     dados = {}
@@ -241,24 +143,19 @@ async def enviar_relatorio():
     for ativo in config.ATIVOS:
         try:
             preco, variacao = market.dados_ativo(ativo)
-            if preco is None or variacao is None:
-                continue
-            dados[ativo] = (preco, variacao)
-        except Exception as e:
-            await log_bot("Erro ao buscar ativo", f"{ativo}\n{e}")
+            if preco is not None and variacao is not None:
+                dados[ativo] = (preco, variacao)
+        except:
+            continue
 
     if not dados:
         return
 
-    # Discord
     canal = bot.get_channel(config.CANAL_ANALISE)
     if canal:
         await canal.send(embed=embed_relatorio(dados, cotacao))
 
-    # Telegram
-    texto = gerar_texto_telegram(dados)
-    telegram.enviar_telegram(texto)
-
+    telegram.enviar_telegram(gerar_texto_telegram(dados))
 
 async def enviar_jornal():
     noticias = news.noticias()
@@ -267,30 +164,26 @@ async def enviar_jornal():
 
     canal = bot.get_channel(config.CANAL_NOTICIAS)
     if canal:
-        await canal.send(embed=embed_jornal(noticias))
-
-# ─────────────────────────────
-# EVENTO READY
-# ─────────────────────────────
+        embed = discord.Embed(
+            title="🗞️ Jornal do Mercado",
+            description="\n\n".join(f"📰 {n}" for n in noticias[:6]),
+            color=0x00BFFF
+        )
+        await canal.send(embed=embed)
 
 @bot.event
 async def on_ready():
     print(f"🤖 Conectado como {bot.user}")
     scheduler.start()
 
-# ─────────────────────────────
-# COMANDOS ADMIN
-# ─────────────────────────────
-
 @bot.command(name="comandos")
 @commands.has_permissions(administrator=True)
 async def comandos(ctx):
     await ctx.send(
-        "**📌 Comandos disponíveis (Admin):**\n"
-        "`!testarpublicacoes` → envia relatório + jornal agora\n"
-        "`!reiniciar` → reinicia o bot"
+        "**Comandos (Admin):**\n"
+        "`!testarpublicacoes`\n"
+        "`!reiniciar`"
     )
-
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -299,22 +192,16 @@ async def testarpublicacoes(ctx):
     await enviar_jornal()
     await ctx.send("✅ Publicações enviadas")
 
-
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def reiniciar(ctx):
-    await ctx.send("🔄 Reiniciando bot...")
+    await ctx.send("🔄 Reiniciando...")
     await asyncio.sleep(2)
     await bot.close()
-
-# ─────────────────────────────
-# SCHEDULER AUTOMÁTICO
-# ─────────────────────────────
 
 @tasks.loop(minutes=1)
 async def scheduler():
     global ultimo_manha, ultimo_tarde
-
     agora = datetime.now(BR_TZ)
     hora = agora.strftime("%H:%M")
 
@@ -326,9 +213,5 @@ async def scheduler():
     if hora == "18:00" and ultimo_tarde != agora.date():
         await enviar_jornal()
         ultimo_tarde = agora.date()
-
-# ─────────────────────────────
-# START
-# ─────────────────────────────
 
 bot.run(TOKEN)
