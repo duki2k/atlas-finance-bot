@@ -64,7 +64,21 @@ def emoji_var(v):
     if v < 0:
         return "🔽"
     return "⏺️"
-@@ -315,41 +320,53 @@ async def comandos(ctx):
+@@ -301,55 +306,79 @@ async def comandos(ctx):
+        title="🤖 Atlas Finance — Comandos",
+        description="Acesso restrito a administradores",
+        color=0x5865F2
+    )
+    embed.add_field(
+        name="🧪 Testes",
+        value="`!testarpublicacoes` → envia relatório + jornal + telegram agora",
+        inline=False
+    )
+    embed.add_field(
+        name="⏱️ Automático",
+        value="06:00 e 18:00 (relatório + jornal + telegram)",
+        inline=False
+    )
     embed.add_field(
         name="⚙️ Sistema",
         value="`!reiniciar` → reinicia o bot",
@@ -76,7 +90,12 @@ def emoji_var(v):
 @commands.has_permissions(administrator=True)
 async def testarpublicacoes(ctx):
     await ctx.send("🧪 Disparando publicações...")
-    await enviar_publicacoes("Teste Manual")
+    try:
+        await enviar_publicacoes("Teste Manual")
+    except Exception as exc:
+        await log_bot("Erro no teste manual", f"{exc}")
+        await ctx.send("❌ Falha no teste. Verifique os logs.")
+        return
     await ctx.send("✅ Teste finalizado")
 
 @bot.command()
@@ -85,6 +104,13 @@ async def reiniciar(ctx):
     await ctx.send("🔄 Reiniciando bot...")
     await asyncio.sleep(2)
     await bot.close()
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Você não tem permissão para usar este comando.")
+        return
+    await log_bot("Erro em comando", str(error))
 
 # ─────────────────────────────
 # SCHEDULER (06h / 18h)
