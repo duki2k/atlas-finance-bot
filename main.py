@@ -1,3 +1,4 @@
+# main.py
 import os
 import asyncio
 import discord
@@ -19,8 +20,14 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# Scheduler controle
 ultimo_manha = None
 ultimo_tarde = None
+
+# Rompimento
+ULTIMO_PRECO = {}  # {ativo: preco}
+FALHAS_SEGUIDAS = {}  # {ativo: count} -> para reduzir spam no log
+
 
 # ─────────────────────────────
 # UTIL
@@ -33,8 +40,9 @@ def dolar_para_real():
             timeout=10
         ).json()
         return float(r["rates"]["BRL"])
-    except:
+    except Exception:
         return 5.0
+
 
 async def log_bot(titulo, mensagem):
     canal = bot.get_channel(config.CANAL_LOGS)
@@ -44,14 +52,8 @@ async def log_bot(titulo, mensagem):
     embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
 
-def sentimento(altas, quedas):
-    if altas > quedas:
-        return "😄 Mercado positivo", 0x2ECC71
-    if quedas > altas:
-        return "😨 Mercado defensivo", 0xE74C3C
-    return "😐 Mercado neutro", 0xF1C40F
 
-def emoji_var(v):
+def emoji_var(v: float):
     if v is None:
         return "⏺️"
     if v > 0:
@@ -60,35 +62,80 @@ def emoji_var(v):
         return "🔽"
     return "⏺️"
 
+
+def sentimento(altas, quedas):
+    if altas > quedas:
+        return "😄 Mercado positivo", 0x2ECC71
+    if quedas > altas:
+        return "😨 Mercado defensivo", 0xE74C3C
+    return "😐 Mercado neutro", 0xF1C40F
+
+
 def texto_cenario(sent_label):
     if "positivo" in sent_label:
         return (
-            "🧭 **Cenário:** apetite por risco maior.\n"
+            "🧭 Cenário: apetite por risco maior.\n"
             "✅ Foque em qualidade e tendência.\n"
             "⚠️ Evite exagerar na alavancagem."
         )
     if "defensivo" in sent_label:
         return (
-            "🧭 **Cenário:** aversão a risco.\n"
-            "🛡️ Priorize proteção, caixa e ativos mais resilientes.\n"
-            "🎯 Procure entradas apenas com confirmação."
+            "🧭 Cenário: aversão a risco.\n"
+            "🛡️ Priorize proteção e liquidez.\n"
+            "🎯 Entradas só com confirmação."
         )
     return (
-        "🧭 **Cenário:** mercado lateral/indefinido.\n"
-        "🎯 Seja seletivo e opere menor.\n"
+        "🧭 Cenário: mercado lateral/indefinido.\n"
+        "🎯 Seletividade e posição menor.\n"
         "⏳ Espere direção antes de aumentar exposição."
     )
 
+
 def ideias_em_baixa_educacional():
-    # Educação — sem recomendar ativo específico
     return (
-        "💡 **Se o dia estiver em baixa (educacional):**\n"
-        "• Prefira **qualidade** (empresas grandes e lucrativas)\n"
-        "• Busque **ETFs amplos** (diversificação)\n"
-        "• Avalie **setores defensivos** (consumo básico, saúde)\n"
-        "• Pense em **aportes fracionados** (compras em etapas)\n"
-        "• Mantenha **liquidez** e evite entrar “no impulso”"
+        "💡 Se o dia estiver em baixa (educacional):\n"
+        "• Prefira qualidade e empresas resilientes\n"
+        "• Use ETFs amplos para diversificar\n"
+        "• Setores defensivos (consumo básico, saúde)\n"
+        "• Faça aportes em etapas (não tudo de uma vez)\n"
+        "• Preserve liquidez e evite impulso"
     )
+
+
+# ─────────────────────────────
+# ROMPIMENTO URGENTE
+# ─────────────────────────────
+
+async def alerta_rompimento(ativo, preco_atual, categoria):
+    canal = bot.get_channel(config.CANAL_NOTICIAS)
+    if not canal:
+        return
+
+    preco_antigo = ULTIMO_PRECO.get(ativo)
+    ULTIMO_PRECO[ativo] = preco_atual
+
+    if preco_antigo is None or preco_antigo <= 0:
+        return
+
+    variacao = ((preco_atual - preco_antigo) / preco_antigo) * 100
+    if abs(variacao) < float(config.LIMITE_ROMPIMENTO_PCT):
+        return
+
+    direcao = "🚨🔼 ROMPIMENTO DE ALTA" if variacao > 0 else "🚨🔽 ROMPIMENTO DE BAIXA"
+    cor = 0x2ECC71 if variacao > 0 else 0xE74C3C
+
+    embed = discord.Embed(
+        title=direcao,
+        description=f"Ativo: **{ativo}**\nCategoria: **{categoria}**",
+        color=cor
+    )
+    embed.add_field(name="Preço anterior", value=f"{preco_antigo:,.4f}", inline=True)
+    embed.add_field(name="Preço atual", value=f"{preco_atual:,.4f}", inline=True)
+    embed.add_field(name="Movimento", value=f"{variacao:+.2f}%", inline=False)
+    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
+
+    await canal.send(embed=embed)
+
 
 # ─────────────────────────────
 # COLETA EM LOTES
@@ -96,21 +143,44 @@ def ideias_em_baixa_educacional():
 
 async def coletar_lote(categoria, ativos, delay=0.35):
     itens = []
+
     for ativo in ativos:
         try:
             p, v = market.dados_ativo(ativo)
+
+            # FIIs: se preço não veio, pula sem log
+            if ativo.endswith("11.SA") and p is None:
+                continue
+
             if p is None or v is None:
-                await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
-            else:
-                itens.append((ativo, p, v))
+                # reduz spam: só loga se falhar 3 vezes seguidas
+                FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
+                if FALHAS_SEGUIDAS[ativo] >= 3:
+                    await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
+                    FALHAS_SEGUIDAS[ativo] = 0
+                await asyncio.sleep(delay)
+                continue
+
+            # reset falhas
+            FALHAS_SEGUIDAS[ativo] = 0
+
+            itens.append((ativo, p, v))
+
+            # alerta rompimento
+            await alerta_rompimento(ativo, p, categoria)
+
         except Exception as e:
             await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{e}")
+
         await asyncio.sleep(delay)
+
     return itens
+
 
 async def coletar_dados():
     dados = {}
     total = 0
+
     for categoria, ativos in config.ATIVOS.items():
         lote = await coletar_lote(categoria, ativos)
         if lote:
@@ -120,29 +190,26 @@ async def coletar_dados():
     if total == 0:
         await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
         return {}
+
     return dados
 
+
 # ─────────────────────────────
-# DISCORD EMBEDS
+# EMBEDS
 # ─────────────────────────────
 
 def embed_relatorio(dados, cotacao):
-    altas = 0
-    quedas = 0
-
-    # top moves geral
     moves = []
     for categoria, itens in dados.items():
         for ativo, preco, var in itens:
-            moves.append((ativo, var))
+            moves.append((ativo, preco, var))
 
-    top_alta = sorted(moves, key=lambda x: x[1], reverse=True)[:3]
-    top_baixa = sorted(moves, key=lambda x: x[1])[:3]
+    altas = sum(1 for _, _, v in moves if v > 0)
+    quedas = sum(1 for _, _, v in moves if v < 0)
+    sent_label, cor = sentimento(altas, quedas)
 
-    sent_label, cor = sentimento(
-        sum(1 for _, v in moves if v > 0),
-        sum(1 for _, v in moves if v < 0)
-    )
+    top_alta = sorted(moves, key=lambda x: x[2], reverse=True)[:3]
+    top_baixa = sorted(moves, key=lambda x: x[2])[:3]
 
     embed = discord.Embed(
         title="📊 Relatório Completo do Mercado",
@@ -150,18 +217,16 @@ def embed_relatorio(dados, cotacao):
         color=cor
     )
 
-    if top_alta:
-        embed.add_field(
-            name="🔝 Top 3 Altas",
-            value="\n".join(f"• `{a}` {emoji_var(v)} {v:.2f}%" for a, v in top_alta),
-            inline=False
-        )
-    if top_baixa:
-        embed.add_field(
-            name="🔻 Top 3 Quedas",
-            value="\n".join(f"• `{a}` {emoji_var(v)} {v:.2f}%" for a, v in top_baixa),
-            inline=False
-        )
+    embed.add_field(
+        name="🔝 Top 3 Altas",
+        value="\n".join(f"• `{a}` {emoji_var(v)} {v:.2f}%" for a, _, v in top_alta) if top_alta else "—",
+        inline=False
+    )
+    embed.add_field(
+        name="🔻 Top 3 Quedas",
+        value="\n".join(f"• `{a}` {emoji_var(v)} {v:.2f}%" for a, _, v in top_baixa) if top_baixa else "—",
+        inline=False
+    )
 
     for categoria, itens in dados.items():
         linhas = []
@@ -171,36 +236,34 @@ def embed_relatorio(dados, cotacao):
             )
         embed.add_field(name=categoria, value="\n".join(linhas), inline=False)
 
-    embed.set_footer(text="Atlas Finance • Dados reais (com fallback)")
-
+    embed.set_footer(text="Atlas Finance • Dados com fallback + cache")
     return embed
 
-def embed_jornal(noticias, periodo):
+
+def embed_jornal(manchetes, periodo):
     embed = discord.Embed(
         title=f"🗞️ Jornal do Mercado — {periodo}",
         description="🌍 Principais manchetes e impactos no mercado",
         color=0x00BFFF
     )
-    if noticias:
-        embed.add_field(
-            name="🔥 Manchetes (mundo)",
-            value="\n\n".join(f"📰 {n}" for n in noticias[:8]),
-            inline=False
-        )
+
+    if manchetes:
+        blocos = []
+        for i, n in enumerate(manchetes[:10], start=1):
+            blocos.append(f"📰 **{i}.** {n}")
+        embed.add_field(name="🔥 Manchetes (Mundo)", value="\n\n".join(blocos), inline=False)
     else:
         embed.add_field(
-            name="⚠️ Sem manchetes",
-            value="O RSS não retornou resultados agora. Tentaremos novamente no próximo ciclo.",
+            name="⚠️ Sem manchetes agora",
+            value="O RSS retornou vazio neste momento. Tentaremos novamente no próximo ciclo.",
             inline=False
         )
-    embed.set_footer(text="Fontes: Google News RSS")
+
+    embed.set_footer(text="Fonte: Google News RSS")
     return embed
 
-# ─────────────────────────────
-# TELEGRAM (MAIS BONITO)
-# ─────────────────────────────
 
-def telegram_resumo(dados, noticias, periodo):
+def telegram_resumo(dados, manchetes, periodo):
     moves = []
     for categoria, itens in dados.items():
         for ativo, preco, var in itens:
@@ -214,48 +277,40 @@ def telegram_resumo(dados, noticias, periodo):
     top_baixa = sorted(moves, key=lambda x: x[2])[:3]
 
     txt = []
-    txt.append(f"📊 *Resumo do Mercado — {periodo}*")
+    txt.append(f"📊 Resumo do Mercado — {periodo}")
     txt.append(f"{sent_label}")
     txt.append("")
-    txt.append(texto_cenario(sent_label).replace("**", "").replace("•", "-"))
+    txt.append(texto_cenario(sent_label))
     txt.append("")
 
-    if top_alta:
-        txt.append("🔝 Top 3 Altas")
-        for a, _, v in top_alta:
-            txt.append(f"- {a} {emoji_var(v)} {v:.2f}%")
-        txt.append("")
+    txt.append("🔝 Top 3 Altas")
+    txt.extend([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_alta] or ["- —"])
+    txt.append("")
 
-    if top_baixa:
-        txt.append("🔻 Top 3 Quedas")
-        for a, _, v in top_baixa:
-            txt.append(f"- {a} {emoji_var(v)} {v:.2f}%")
-        txt.append("")
+    txt.append("🔻 Top 3 Quedas")
+    txt.extend([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_baixa] or ["- —"])
+    txt.append("")
 
-    # manchetes
-    if noticias:
-        txt.append("🌍 Manchetes do mundo (impactos)")
-        for n in noticias[:6]:
+    txt.append("🌍 Manchetes do Mundo")
+    if manchetes:
+        for n in manchetes[:6]:
             txt.append(f"📰 {n}")
-        txt.append("")
     else:
-        txt.append("🌍 Manchetes do mundo")
         txt.append("📰 (sem manchetes disponíveis agora)")
-        txt.append("")
+    txt.append("")
 
-    # educativo
     txt.append(ideias_em_baixa_educacional())
     txt.append("")
     txt.append("— Atlas Finance")
 
-    # Telegram.py está sem parse_mode. Mantém texto simples.
     return "\n".join(txt)
 
+
 # ─────────────────────────────
-# ENVIO
+# PUBLICAÇÕES
 # ─────────────────────────────
 
-async def enviar_publicacoes(periodo):
+async def enviar_publicacoes(periodo, canal_relatorio=None, canal_jornal=None, enviar_tg=True):
     dados = await coletar_dados()
     if not dados:
         return
@@ -263,29 +318,33 @@ async def enviar_publicacoes(periodo):
     cot = dolar_para_real()
     manchetes = news.noticias()
 
-    # Discord: relatório
-    canal_analise = bot.get_channel(config.CANAL_ANALISE)
-    if canal_analise:
-        await canal_analise.send(embed=embed_relatorio(dados, cot))
-
-    # Discord: jornal
-    canal_news = bot.get_channel(config.CANAL_NOTICIAS)
-    if canal_news:
-        await canal_news.send(embed=embed_jornal(manchetes, periodo))
+    # Discord relatório
+    canal_rel = canal_relatorio or bot.get_channel(config.CANAL_ANALISE)
+    if canal_rel:
+        await canal_rel.send(embed=embed_relatorio(dados, cot))
     else:
-        await log_bot("CANAL_NOTICIAS inválido", "Não encontrei o canal de notícias no Discord.")
+        await log_bot("CANAL_ANALISE inválido", "Não encontrei o canal de análise.")
 
-    # Telegram: resumo com notícias
-    ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
-    if not ok:
-        await log_bot("Telegram", "Falha ao enviar mensagem (token/chat_id/permissão).")
+    # Discord jornal
+    canal_j = canal_jornal or bot.get_channel(config.CANAL_NOTICIAS)
+    if canal_j:
+        await canal_j.send(embed=embed_jornal(manchetes, periodo))
+    else:
+        await log_bot("CANAL_NOTICIAS inválido", "Não encontrei o canal de notícias.")
 
-    # log se RSS vier vazio
+    # Telegram
+    if enviar_tg:
+        ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
+        if not ok:
+            await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
+
+    # Log de RSS vazio
     if not manchetes:
         await log_bot("RSS vazio", "news.noticias() retornou lista vazia (pode ser temporário).")
 
+
 # ─────────────────────────────
-# EVENTOS E COMANDOS
+# COMANDOS (ADMIN ONLY)
 # ─────────────────────────────
 
 @bot.event
@@ -298,18 +357,32 @@ async def on_ready():
 @commands.has_permissions(administrator=True)
 async def comandos(ctx):
     embed = discord.Embed(
-        title="🤖 Atlas Finance — Comandos",
-        description="Acesso restrito a administradores",
+        title="🤖 Atlas Finance — Comandos (Admin)",
+        description="Testes separados por canal + Telegram",
         color=0x5865F2
     )
     embed.add_field(
-        name="🧪 Testes",
-        value="`!testarpublicacoes` → envia relatório + jornal + telegram agora",
+        name="🧪 Testes (Discord)",
+        value=(
+            "`!testrelatorio` → envia relatório neste canal\n"
+            "`!testjornal` → envia jornal neste canal\n"
+            "`!testtudo` → relatório + jornal neste canal (sem mexer nos canais oficiais)"
+        ),
         inline=False
     )
     embed.add_field(
-        name="⏱️ Automático",
-        value="06:00 e 18:00 (relatório + jornal + telegram)",
+        name="📨 Testes (Telegram)",
+        value="`!testtelegram` → envia um resumo no Telegram",
+        inline=False
+    )
+    embed.add_field(
+        name="🚨 Testes (Rompimento)",
+        value="`!testrompimento` → simula alerta urgente no canal de notícias",
+        inline=False
+    )
+    embed.add_field(
+        name="⏱️ Publicações oficiais",
+        value="Automático 06:00 e 18:00 (Discord + Telegram)",
         inline=False
     )
     embed.add_field(
@@ -321,10 +394,60 @@ async def comandos(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def testarpublicacoes(ctx):
-    await ctx.send("🧪 Disparando publicações...")
-    await enviar_publicacoes("Teste Manual")
-    await ctx.send("✅ Teste finalizado")
+async def testrelatorio(ctx):
+    await ctx.send("🧪 Gerando relatório aqui...")
+    dados = await coletar_dados()
+    if not dados:
+        await ctx.send("❌ Não consegui coletar dados.")
+        return
+    cot = dolar_para_real()
+    await ctx.send(embed=embed_relatorio(dados, cot))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testjornal(ctx):
+    await ctx.send("🧪 Gerando jornal aqui...")
+    manchetes = news.noticias()
+    await ctx.send(embed=embed_jornal(manchetes, "Teste (canal atual)"))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testtudo(ctx):
+    await ctx.send("🧪 Enviando relatório + jornal neste canal...")
+    await enviar_publicacoes("Teste (canal atual)", canal_relatorio=ctx.channel, canal_jornal=ctx.channel, enviar_tg=False)
+    await ctx.send("✅ OK (sem Telegram)")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testtelegram(ctx):
+    await ctx.send("🧪 Enviando teste no Telegram...")
+    dados = await coletar_dados()
+    if not dados:
+        await ctx.send("❌ Não consegui coletar dados.")
+        return
+    manchetes = news.noticias()
+    ok = telegram.enviar_telegram(telegram_resumo(dados, manchetes, "Teste Telegram"))
+    await ctx.send("✅ Telegram enviado" if ok else "❌ Falha no Telegram (token/chat_id)")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def testrompimento(ctx):
+    canal = bot.get_channel(config.CANAL_NOTICIAS)
+    if not canal:
+        await ctx.send("❌ CANAL_NOTICIAS inválido.")
+        return
+
+    embed = discord.Embed(
+        title="🚨🔼 ROMPIMENTO DE ALTA (TESTE)",
+        description="Simulação de alerta urgente",
+        color=0x2ECC71
+    )
+    embed.add_field(name="Ativo", value="TESTE", inline=True)
+    embed.add_field(name="Movimento", value="+2.50%", inline=True)
+    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
+
+    await canal.send(embed=embed)
+    await ctx.send("✅ Rompimento teste enviado no canal de notícias")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -334,13 +457,12 @@ async def reiniciar(ctx):
     await bot.close()
 
 # ─────────────────────────────
-# SCHEDULER (06h / 18h)
+# SCHEDULER 06h/18h
 # ─────────────────────────────
 
 @tasks.loop(minutes=1)
 async def scheduler():
     global ultimo_manha, ultimo_tarde
-
     agora = datetime.now(BR_TZ)
     hora = agora.strftime("%H:%M")
 
