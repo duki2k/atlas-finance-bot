@@ -17,16 +17,15 @@ import telegram
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-# Slash commands NÃO precisam de message_content
+# Slash-only: não precisa message_content
 intents = discord.Intents.default()
-
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
 
-# Rompimento
+# Rompimento (funcionalidade continua ativa)
 ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
 
@@ -38,11 +37,11 @@ _FX_TTL = 600  # 10 min
 # Locks anti-overlap
 PUBLICACAO_LOCK = asyncio.Lock()
 
-# Concorrência de coleta (ajuste via env no Railway: MAX_CONCURRENCY=6/8/10)
+# Concorrência de coleta
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
-# Sync do tree (não ficar rodando toda vez)
+# Sync do tree
 _TREE_SYNCED = False
 
 
@@ -94,43 +93,6 @@ def ideias_em_baixa() -> str:
         "• Evite decisões por impulso"
     )
 
-def embed_menu_comandos() -> discord.Embed:
-    embed = discord.Embed(
-        title="🤖 Atlas Finance — Comandos (Admin)",
-        description="✅ Use `/` para ver sugestões automáticas.",
-        color=0x5865F2
-    )
-    embed.add_field(
-        name="🧪 Testes (canal atual)",
-        value=(
-            "`/testrelatorio` → envia relatório aqui\n"
-            "`/testjornal` → envia jornal aqui\n"
-            "`/testtudo` → relatório+jornal aqui (sem Telegram)"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="📌 Testes (canais oficiais)",
-        value="`/testarpublicacoes` → dispara nos canais oficiais + Telegram",
-        inline=False
-    )
-    embed.add_field(
-        name="📨 Testes (Telegram)",
-        value="`/testtelegram` → manda resumo no Telegram",
-        inline=False
-    )
-    embed.add_field(
-        name="🚨 Testes (Urgente)",
-        value="`/testrompimento` → simula alerta urgente no canal de notícias",
-        inline=False
-    )
-    embed.add_field(
-        name="⚙️ Sistema",
-        value="`/reiniciar` → reinicia o bot",
-        inline=False
-    )
-    return embed
-
 async def log_bot(titulo: str, mensagem: str):
     canal = bot.get_channel(config.CANAL_LOGS)
     if not canal:
@@ -165,7 +127,7 @@ async def dolar_para_real_async() -> float:
 
 
 # ─────────────────────────────
-# ALERTA URGENTE (ROMPIMENTO)
+# ALERTA AUTOMÁTICO (ROMPIMENTO) — continua ativo
 # ─────────────────────────────
 
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
@@ -364,7 +326,7 @@ def telegram_resumo(dados: dict, manchetes: list, periodo: str):
 # PUBLICAÇÕES (COM LOCK)
 # ─────────────────────────────
 
-async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jornal_id=None, enviar_tg=True):
+async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
     if PUBLICACAO_LOCK.locked():
         await log_bot("Scheduler", "Ignorado: execução já em andamento (anti-overlap).")
         return
@@ -377,8 +339,8 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
         cot = await dolar_para_real_async()
         manchetes = await news.noticias()
 
-        canal_rel = bot.get_channel(canal_relatorio_id or config.CANAL_ANALISE)
-        canal_j = bot.get_channel(canal_jornal_id or config.CANAL_NOTICIAS)
+        canal_rel = bot.get_channel(config.CANAL_ANALISE)
+        canal_j = bot.get_channel(config.CANAL_NOTICIAS)
 
         if canal_rel:
             await canal_rel.send(embed=embed_relatorio(dados, cot))
@@ -417,10 +379,10 @@ async def on_ready():
         news.set_session(HTTP)
         telegram.set_session(HTTP)
 
-    # Sync de slash commands (pra aparecer no autocomplete /)
+    # Sync: remove comandos antigos e mantém só os atuais
     if not _TREE_SYNCED:
         try:
-            gid = os.getenv("GUILD_ID")  # opcional, recomendado
+            gid = os.getenv("GUILD_ID")  # recomendado
             if gid:
                 guild = discord.Object(id=int(gid))
                 bot.tree.copy_global_to(guild=guild)
@@ -438,78 +400,18 @@ async def on_ready():
 
 
 # ─────────────────────────────
-# SLASH COMMANDS (/)
+# SLASH COMMANDS (somente 2)
 # ─────────────────────────────
 
-@bot.tree.command(name="comandos", description="Mostra o menu de comandos (Admin)")
+@bot.tree.command(
+    name="testetudo",
+    description="Testa todas as publicações oficiais (Relatório + Jornal + Telegram) (Admin)"
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def slash_comandos(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=embed_menu_comandos(), ephemeral=True)
-
-@bot.tree.command(name="testrelatorio", description="Gera relatório no canal atual (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testrelatorio(interaction: discord.Interaction):
+async def slash_testetudo(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
-    dados = await coletar_dados()
-    if not dados:
-        await interaction.followup.send("❌ Não consegui coletar dados.")
-        return
-    cot = await dolar_para_real_async()
-    await interaction.followup.send(embed=embed_relatorio(dados, cot))
-
-@bot.tree.command(name="testjornal", description="Gera jornal no canal atual (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testjornal(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    manchetes = await news.noticias()
-    await interaction.followup.send(embed=embed_jornal(manchetes, "Teste (canal atual)"))
-
-@bot.tree.command(name="testtudo", description="Relatório + jornal no canal atual (sem Telegram) (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testtudo(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    canal_id = interaction.channel_id
-    await enviar_publicacoes("Teste (canal atual)", canal_relatorio_id=canal_id, canal_jornal_id=canal_id, enviar_tg=False)
-    await interaction.followup.send("✅ OK")
-
-@bot.tree.command(name="testtelegram", description="Envia um resumo para o Telegram (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testtelegram(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    dados = await coletar_dados()
-    if not dados:
-        await interaction.followup.send("❌ Não consegui coletar dados.")
-        return
-    manchetes = await news.noticias()
-    ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, "Teste Telegram"))
-    await interaction.followup.send("✅ Telegram enviado" if ok else "❌ Falha no Telegram (token/chat_id)")
-
-@bot.tree.command(name="testrompimento", description="Simula alerta urgente (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testrompimento(interaction: discord.Interaction):
-    canal = bot.get_channel(config.CANAL_NOTICIAS)
-    if not canal:
-        await interaction.response.send_message("❌ CANAL_NOTICIAS inválido.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🚨🔼 ROMPIMENTO DE ALTA (TESTE)",
-        description="Simulação de alerta urgente",
-        color=0x2ECC71
-    )
-    embed.add_field(name="Ativo", value="TESTE", inline=True)
-    embed.add_field(name="Movimento", value="+2.50%", inline=True)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
-
-    await canal.send(embed=embed)
-    await interaction.response.send_message("✅ Enviado no canal de notícias.", ephemeral=True)
-
-@bot.tree.command(name="testarpublicacoes", description="Dispara nos canais oficiais + Telegram (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testarpublicacoes(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    await enviar_publicacoes("Teste Manual")
-    await interaction.followup.send("✅ Teste finalizado")
+    await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
+    await interaction.followup.send("✅ Disparei todas as publicações oficiais (Discord + Telegram).", ephemeral=True)
 
 @bot.tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -547,11 +449,11 @@ async def scheduler():
     hhmm = agora.strftime("%H:%M")
 
     if hhmm == "06:00" and ultima_manha != agora.date():
-        await enviar_publicacoes("Abertura (06:00)")
+        await enviar_publicacoes("Abertura (06:00)", enviar_tg=True)
         ultima_manha = agora.date()
 
     if hhmm == "18:00" and ultima_tarde != agora.date():
-        await enviar_publicacoes("Fechamento (18:00)")
+        await enviar_publicacoes("Fechamento (18:00)", enviar_tg=True)
         ultima_tarde = agora.date()
 
 
