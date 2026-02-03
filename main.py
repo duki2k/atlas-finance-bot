@@ -2,6 +2,8 @@
 import os
 import asyncio
 import inspect
+import signal
+import contextlib
 import discord
 import pytz
 import aiohttp
@@ -24,21 +26,6 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 # Slash-only: sem message_content
 intents = discord.Intents.default()
 
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# ✅ Sheets + comandos de trading
-store = SheetsStore.from_env()
-register_trading_commands(tree, store, client)
-
-# Controle scheduler (para não disparar 2x no mesmo dia)
-ultima_manha = None
-ultima_tarde = None
-
-# Rompimento
-ULTIMO_PRECO = {}      # {ativo: preco}
-FALHAS_SEGUIDAS = {}   # {ativo: count}
-
 # HTTP session + cache FX
 HTTP: Optional[aiohttp.ClientSession] = None
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
@@ -51,8 +38,19 @@ PUBLICACAO_LOCK = asyncio.Lock()
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
+# Controle scheduler (para não disparar 2x no mesmo dia)
+ultima_manha = None
+ultima_tarde = None
+
+# Rompimento
+ULTIMO_PRECO = {}      # {ativo: preco}
+FALHAS_SEGUIDAS = {}   # {ativo: count}
+
 # Sync do tree
 _TREE_SYNCED = False
+
+# Shutdown guard
+_SHUTTING_DOWN = False
 
 
 # ─────────────────────────────
@@ -72,6 +70,41 @@ async def _call_sync_or_async(fn, *args, **kwargs):
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
     return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+
+
+# ─────────────────────────────
+# CLIENT (close robusto)
+# ─────────────────────────────
+
+class AtlasClient(discord.Client):
+    async def close(self):
+        """
+        Fecha tudo com segurança:
+        - para scheduler
+        - fecha aiohttp session
+        - fecha client
+        """
+        global HTTP
+        # parar scheduler
+        with contextlib.suppress(Exception):
+            if scheduler.is_running():
+                scheduler.cancel()
+
+        # fechar HTTP
+        with contextlib.suppress(Exception):
+            if HTTP is not None and not HTTP.closed:
+                await HTTP.close()
+        HTTP = None
+
+        await super().close()
+
+
+client = AtlasClient(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# Sheets + comandos de trading
+store = SheetsStore.from_env()
+register_trading_commands(tree, store, client)
 
 
 # ─────────────────────────────
@@ -153,6 +186,47 @@ async def dolar_para_real_async() -> float:
             return rate
     except Exception:
         return float(_FX_CACHE.get("rate") or 5.0)
+
+
+# ─────────────────────────────
+# SHUTDOWN / SIGNALS
+# ─────────────────────────────
+
+async def shutdown(reason: str = "shutdown"):
+    global _SHUTTING_DOWN
+    if _SHUTTING_DOWN:
+        return
+    _SHUTTING_DOWN = True
+
+    try:
+        await log_bot("Shutdown", f"Encerrando bot... motivo: {reason}")
+    except Exception:
+        pass
+
+    # garante que não tem execução simultânea “pendurada”
+    with contextlib.suppress(Exception):
+        if PUBLICACAO_LOCK.locked():
+            # não força unlock; só avisa
+            pass
+
+    with contextlib.suppress(Exception):
+        await client.close()
+
+    # dá uma chance pro loop “esvaziar”
+    await asyncio.sleep(0.2)
+
+
+def install_signal_handlers(loop: asyncio.AbstractEventLoop):
+    """
+    Railway normalmente envia SIGTERM no redeploy/stop.
+    """
+    def _handler(sig_name: str):
+        # cria task sem travar handler
+        asyncio.create_task(shutdown(sig_name))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _handler, sig.name)
 
 
 # ─────────────────────────────
@@ -377,8 +451,6 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             return
 
         cot = await dolar_para_real_async()
-
-        # news.noticias pode ser sync ou async
         manchetes = await _maybe_await(news.noticias())
 
         canal_rel = client.get_channel(config.CANAL_ANALISE)
@@ -395,7 +467,6 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg:
-            # telegram.enviar_telegram pode ser sync ou async
             ok = await _maybe_await(telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo)))
             if not ok:
                 await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
@@ -427,9 +498,7 @@ async def on_ready():
                 except Exception:
                     pass
 
-    # Sync controlado por env
     do_sync = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
-
     if do_sync and not _TREE_SYNCED:
         try:
             gid = os.getenv("GUILD_ID")
@@ -466,14 +535,8 @@ async def slash_testetudo(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_reiniciar(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
-    await asyncio.sleep(2)
-
-    global HTTP
-    if HTTP is not None:
-        await HTTP.close()
-        HTTP = None
-
-    await client.close()
+    await asyncio.sleep(1)
+    await shutdown("manual restart")
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -506,4 +569,31 @@ async def scheduler():
         ultima_tarde = agora.date()
 
 
-client.run(TOKEN)
+# ─────────────────────────────
+# ENTRYPOINT ROBUSTO
+# ─────────────────────────────
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN não definido.")
+
+    loop = asyncio.get_running_loop()
+    install_signal_handlers(loop)
+
+    try:
+        await client.start(TOKEN)
+    except Exception as e:
+        # se der crash, tenta fechar limpo
+        with contextlib.suppress(Exception):
+            await log_bot("Crash", f"Exceção no loop principal:\n{e}")
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await client.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
