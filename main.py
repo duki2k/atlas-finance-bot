@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import signal
 import contextlib
+import warnings
 import discord
 import pytz
 import aiohttp
@@ -22,6 +23,10 @@ from commands.trading import register_trading_commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
+
+# 🔇 Evita poluir logs com warning do aiohttp em shutdown rápido (Railway/discord)
+warnings.filterwarnings("ignore", message="Unclosed connector")
+warnings.filterwarnings("ignore", message="Unclosed client session")
 
 intents = discord.Intents.default()
 
@@ -48,8 +53,9 @@ FALHAS_SEGUIDAS = {}   # {ativo: count}
 # Sync do tree
 _TREE_SYNCED = False
 
-# Shutdown guard
+# Shutdown guards
 _SHUTTING_DOWN = False
+_FORCE_EXIT = False
 
 
 # ─────────────────────────────
@@ -68,7 +74,7 @@ async def _call_sync_or_async(fn, *args, **kwargs):
 
 
 # ─────────────────────────────
-# CLIENT
+# CLIENT + COMMAND TREE
 # ─────────────────────────────
 
 client = discord.Client(intents=intents)
@@ -173,7 +179,6 @@ async def _close_http():
     HTTP = None
 
 async def _cancel_pending_tasks():
-    # cancela tasks pendentes (evita loop fechar com coisas abertas)
     current = asyncio.current_task()
     pending = [t for t in asyncio.all_tasks() if t is not current]
     for t in pending:
@@ -195,17 +200,21 @@ async def shutdown(reason: str = "shutdown"):
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
-    # fecha seu HTTP
+    # fechar sua sessão HTTP
     with contextlib.suppress(Exception):
         await asyncio.wait_for(_close_http(), timeout=5)
 
-    # fecha o discord (isso fecha o aiohttp interno do discord.py)
+    # fechar discord (fecha o aiohttp interno do discord.py)
     with contextlib.suppress(Exception):
         await asyncio.wait_for(client.close(), timeout=8)
 
     # evita warnings ao fechar o loop
     with contextlib.suppress(Exception):
         await asyncio.wait_for(_cancel_pending_tasks(), timeout=3)
+
+    # 🚀 Restart rápido no Railway (encerra o processo pra plataforma subir de novo)
+    if _FORCE_EXIT:
+        os._exit(0)
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
     def _handler(sig_name: str):
@@ -467,7 +476,11 @@ async def on_ready():
 
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
-        connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300, enable_cleanup_closed=True)
+        connector = aiohttp.TCPConnector(
+            limit_per_host=MAX_CONCURRENCY,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
         for mod in (market, news, telegram):
@@ -513,6 +526,9 @@ async def slash_testetudo(interaction: discord.Interaction):
 async def slash_reiniciar(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
     await asyncio.sleep(1)
+
+    global _FORCE_EXIT
+    _FORCE_EXIT = True
     await shutdown("manual restart")
 
 @tree.error
@@ -562,9 +578,16 @@ async def main():
         async with client:
             await client.start(TOKEN)
     finally:
-        # segurança extra
         with contextlib.suppress(Exception):
             await _close_http()
+
+def install_signal_handlers(loop: asyncio.AbstractEventLoop):
+    def _handler(sig_name: str):
+        asyncio.create_task(shutdown(sig_name))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _handler, sig.name)
 
 if __name__ == "__main__":
     try:
