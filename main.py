@@ -23,10 +23,9 @@ from commands.trading import register_trading_commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-# Slash-only: sem message_content
 intents = discord.Intents.default()
 
-# HTTP session + cache FX
+# HTTP session (sua) + cache FX
 HTTP: Optional[aiohttp.ClientSession] = None
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
@@ -63,46 +62,19 @@ async def _maybe_await(x: Any):
     return x
 
 async def _call_sync_or_async(fn, *args, **kwargs):
-    """
-    Se fn for async: await.
-    Se fn for sync: roda em thread (não trava o bot).
-    """
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
     return await asyncio.to_thread(lambda: fn(*args, **kwargs))
 
 
 # ─────────────────────────────
-# CLIENT (close robusto)
+# CLIENT
 # ─────────────────────────────
 
-class AtlasClient(discord.Client):
-    async def close(self):
-        """
-        Fecha tudo com segurança:
-        - para scheduler
-        - fecha aiohttp session
-        - fecha client
-        """
-        global HTTP
-        # parar scheduler
-        with contextlib.suppress(Exception):
-            if scheduler.is_running():
-                scheduler.cancel()
-
-        # fechar HTTP
-        with contextlib.suppress(Exception):
-            if HTTP is not None and not HTTP.closed:
-                await HTTP.close()
-        HTTP = None
-
-        await super().close()
-
-
-client = AtlasClient(intents=intents)
+client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Sheets + comandos de trading
+# Sheets + trading commands
 store = SheetsStore.from_env()
 register_trading_commands(tree, store, client)
 
@@ -192,36 +164,51 @@ async def dolar_para_real_async() -> float:
 # SHUTDOWN / SIGNALS
 # ─────────────────────────────
 
+async def _close_http():
+    global HTTP
+    if HTTP is not None:
+        with contextlib.suppress(Exception):
+            if not HTTP.closed:
+                await HTTP.close()
+    HTTP = None
+
+async def _cancel_pending_tasks():
+    # cancela tasks pendentes (evita loop fechar com coisas abertas)
+    current = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not current]
+    for t in pending:
+        t.cancel()
+    with contextlib.suppress(Exception):
+        await asyncio.gather(*pending, return_exceptions=True)
+
 async def shutdown(reason: str = "shutdown"):
     global _SHUTTING_DOWN
     if _SHUTTING_DOWN:
         return
     _SHUTTING_DOWN = True
 
-    try:
-        await log_bot("Shutdown", f"Encerrando bot... motivo: {reason}")
-    except Exception:
-        pass
-
-    # garante que não tem execução simultânea “pendurada”
+    # parar scheduler cedo (não iniciar novas coisas)
     with contextlib.suppress(Exception):
-        if PUBLICACAO_LOCK.locked():
-            # não força unlock; só avisa
-            pass
+        if scheduler.is_running():
+            scheduler.cancel()
 
     with contextlib.suppress(Exception):
-        await client.close()
+        await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
-    # dá uma chance pro loop “esvaziar”
-    await asyncio.sleep(0.2)
+    # fecha seu HTTP
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(_close_http(), timeout=5)
 
+    # fecha o discord (isso fecha o aiohttp interno do discord.py)
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(client.close(), timeout=8)
+
+    # evita warnings ao fechar o loop
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(_cancel_pending_tasks(), timeout=3)
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
-    """
-    Railway normalmente envia SIGTERM no redeploy/stop.
-    """
     def _handler(sig_name: str):
-        # cria task sem travar handler
         asyncio.create_task(shutdown(sig_name))
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -230,7 +217,7 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# ALERTA AUTOMÁTICO (ROMPIMENTO)
+# ALERTA (ROMPIMENTO)
 # ─────────────────────────────
 
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
@@ -269,11 +256,6 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 # ─────────────────────────────
 
 async def _dados_ativo_async(ativo: str):
-    """
-    Compatível com:
-      - market.dados_ativo sync (requests)  -> roda em thread
-      - market.dados_ativo async (aiohttp)  -> await
-    """
     if not hasattr(market, "dados_ativo"):
         return None, None
     return await _call_sync_or_async(market.dados_ativo, ativo)
@@ -283,7 +265,6 @@ async def _fetch_one(categoria: str, ativo: str):
         try:
             p, v = await _dados_ativo_async(ativo)
 
-            # FIIs: se preço não veio, não loga, só ignora
             if ativo.endswith("11.SA") and p is None:
                 return None
 
@@ -484,19 +465,15 @@ async def on_ready():
     global HTTP, _TREE_SYNCED
     print(f"🤖 Conectado como {client.user}")
 
-    # cria session HTTP (para FX e, se seus módulos suportarem, para providers)
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
-        connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300)
+        connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300, enable_cleanup_closed=True)
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-        # chama set_session se existir (não quebra se seus módulos não tiverem)
         for mod in (market, news, telegram):
             if hasattr(mod, "set_session"):
-                try:
+                with contextlib.suppress(Exception):
                     mod.set_session(HTTP)
-                except Exception:
-                    pass
 
     do_sync = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
     if do_sync and not _TREE_SYNCED:
@@ -570,7 +547,7 @@ async def scheduler():
 
 
 # ─────────────────────────────
-# ENTRYPOINT ROBUSTO
+# ENTRYPOINT ROBUSTO (discord.py cleanup)
 # ─────────────────────────────
 
 async def main():
@@ -580,17 +557,14 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
+    # ✅ forma mais robusta: garante cleanup do aiohttp interno do discord.py
     try:
-        await client.start(TOKEN)
-    except Exception as e:
-        # se der crash, tenta fechar limpo
-        with contextlib.suppress(Exception):
-            await log_bot("Crash", f"Exceção no loop principal:\n{e}")
-        raise
+        async with client:
+            await client.start(TOKEN)
     finally:
+        # segurança extra
         with contextlib.suppress(Exception):
-            await client.close()
-
+            await _close_http()
 
 if __name__ == "__main__":
     try:
