@@ -3,43 +3,36 @@ import os
 import asyncio
 import contextlib
 import signal
-import inspect
 import discord
 import pytz
+import aiohttp
 from datetime import datetime
 from discord.ext import tasks
 from discord import app_commands
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import config
 import market
 import news
 import telegram
 
-# ─────────────────────────────
-# ENV
-# ─────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
+# Slash-only
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# ENV controles
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "6") or "6")
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 
-# ─────────────────────────────
-# DISCORD (Slash-only)
-# ─────────────────────────────
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# ─────────────────────────────
-# STATE
-# ─────────────────────────────
+# Estado
 PUBLICACAO_LOCK = asyncio.Lock()
-
 ultima_manha = None
 ultima_tarde = None
 
@@ -48,29 +41,21 @@ FALHAS_SEGUIDAS: Dict[str, int] = {}
 
 _TREE_SYNCED = False
 _SHUTTING_DOWN = False
-_FORCE_EXIT = False  # usado no /reiniciar para Railway religar
+_FORCE_EXIT = False
 
-# FX cache (USD->BRL)
+HTTP: Optional[aiohttp.ClientSession] = None
+
+# FX cache
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
 
 # ─────────────────────────────
-# Helpers: sync/async compat
+# Utils
 # ─────────────────────────────
-async def _call_sync_or_async(fn, *args, **kwargs):
-    """Permite chamar função sync (em thread) ou async (await)."""
-    if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
-
 def _now_br() -> str:
     return datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
 
-
-# ─────────────────────────────
-# Util / Embeds
-# ─────────────────────────────
 def emoji_var(v: float) -> str:
     if v is None:
         return "⏺️"
@@ -115,63 +100,56 @@ def ideias_em_baixa() -> str:
         "• Evite decisões por impulso"
     )
 
-def _get_cfg_int(name: str, default: int = 0) -> int:
-    return int(getattr(config, name, default) or default)
-
-def _get_cfg_bool(name: str, default: bool = True) -> bool:
-    v = getattr(config, name, default)
-    return bool(v)
-
-def _get_cfg_float(name: str, default: float = 2.0) -> float:
-    try:
-        return float(getattr(config, name, default))
-    except Exception:
-        return default
-
 async def log_bot(titulo: str, mensagem: str):
-    canal_logs = _get_cfg_int("CANAL_LOGS", 0)
-    if canal_logs <= 0:
-        return
-    canal = client.get_channel(canal_logs)
+    canal_id = getattr(config, "CANAL_LOGS", 0)
+    canal = client.get_channel(int(canal_id)) if canal_id else None
     if not canal:
         return
     embed = discord.Embed(title=f"📋 {titulo}", description=mensagem, color=0xE67E22)
     embed.set_footer(text=_now_br())
     await canal.send(embed=embed)
 
+def _admin_channel_ok(interaction: discord.Interaction) -> bool:
+    canal_admin = getattr(config, "CANAL_ADMIN", 0)
+    if canal_admin and interaction.channel_id != int(canal_admin):
+        return False
+    return True
+
 
 # ─────────────────────────────
-# FX (USD->BRL) (em thread, com cache)
+# FX (USD->BRL) usando a mesma sessão aiohttp
 # ─────────────────────────────
-def _dolar_para_real_sync() -> float:
-    import requests
-    r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=BRL", timeout=10)
-    data = r.json()
-    rate = data.get("rates", {}).get("BRL")
-    return float(rate) if rate else 5.0
-
 async def dolar_para_real_async() -> float:
+    global _FX_CACHE, HTTP
     now = asyncio.get_event_loop().time()
+
     if (now - _FX_CACHE["ts"]) < _FX_TTL and _FX_CACHE["rate"] > 0:
         return float(_FX_CACHE["rate"])
 
+    if HTTP is None:
+        return float(_FX_CACHE.get("rate") or 5.0)
+
+    url = "https://api.exchangerate.host/latest"
+    params = {"base": "USD", "symbols": "BRL"}
+
     try:
-        rate = await asyncio.to_thread(_dolar_para_real_sync)
-        _FX_CACHE["rate"] = float(rate)
-        _FX_CACHE["ts"] = now
-        return float(rate)
+        async with HTTP.get(url, params=params, timeout=10) as r:
+            r.raise_for_status()
+            data = await r.json()
+            rate = data.get("rates", {}).get("BRL")
+            rate = float(rate) if rate else 5.0
+            _FX_CACHE = {"rate": rate, "ts": now}
+            return rate
     except Exception:
         return float(_FX_CACHE.get("rate") or 5.0)
 
 
 # ─────────────────────────────
-# Rompimento (automático)
+# Rompimento
 # ─────────────────────────────
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
-    canal_id = _get_cfg_int("CANAL_NOTICIAS", 0)
-    if canal_id <= 0:
-        return
-    canal = client.get_channel(canal_id)
+    canal_id = getattr(config, "CANAL_NOTICIAS", 0)
+    canal = client.get_channel(int(canal_id)) if canal_id else None
     if not canal:
         return
 
@@ -181,7 +159,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
     if preco_antigo is None or preco_antigo <= 0:
         return
 
-    limite = _get_cfg_float("LIMITE_ROMPIMENTO_PCT", 2.0)
+    limite = float(getattr(config, "LIMITE_ROMPIMENTO_PCT", 2.0))
     var = ((preco_atual - preco_antigo) / preco_antigo) * 100.0
     if abs(var) < limite:
         return
@@ -202,14 +180,13 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
 
 # ─────────────────────────────
-# Coleta concorrente (market.py é sync -> roda em thread)
+# Coleta concorrente (market.py é async no teu ZIP)
 # ─────────────────────────────
 async def _fetch_one(categoria: str, ativo: str):
     async with SEM:
         try:
-            p, v = await _call_sync_or_async(market.dados_ativo, ativo)
+            p, v = await market.dados_ativo(ativo)
 
-            # FIIs: se preço não veio, ignora sem log
             if ativo.endswith("11.SA") and p is None:
                 return None
 
@@ -223,19 +200,19 @@ async def _fetch_one(categoria: str, ativo: str):
             FALHAS_SEGUIDAS[ativo] = 0
             await alerta_rompimento(ativo, float(p), categoria)
             return (ativo, float(p), float(v))
+
         except Exception as e:
-            await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{e}")
+            await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{type(e).__name__}: {e}")
             return None
 
 async def coletar_dados():
-    coros: List[Any] = []
-    order: List[Tuple[str, str]] = []
-
     ativos_map = getattr(config, "ATIVOS", {})
     if not isinstance(ativos_map, dict) or not ativos_map:
-        await log_bot("Config", "ATIVOS não definido ou vazio no config.py.")
+        await log_bot("Config", "ATIVOS vazio ou inválido no config.py.")
         return {}
 
+    coros: List[asyncio.Task] = []
+    order: List[Tuple[str, str]] = []
     for categoria, ativos in ativos_map.items():
         for ativo in ativos:
             coros.append(_fetch_one(categoria, ativo))
@@ -252,18 +229,17 @@ async def coletar_dados():
         total += 1
 
     if total == 0:
-        await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
+        await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos (falha geral).")
         return {}
 
     return dados
 
 
 # ─────────────────────────────
-# Embeds (Relatório + Jornal)
+# Embeds + Telegram
 # ─────────────────────────────
 def embed_relatorio(dados: dict, cot: float):
     moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
-
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
     sent_label, cor = sentimento_geral(altas, quedas)
@@ -332,7 +308,6 @@ def embed_jornal(manchetes: list, periodo: str):
 
 def telegram_resumo(dados: dict, manchetes: list, periodo: str):
     moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
-
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
     sent_label, _ = sentimento_geral(altas, quedas)
@@ -354,6 +329,7 @@ def telegram_resumo(dados: dict, manchetes: list, periodo: str):
         "",
         "🌍 Manchetes do Mundo",
     ]
+
     if manchetes:
         for m in manchetes[:6]:
             linhas.append(f"📰 {m}")
@@ -365,62 +341,72 @@ def telegram_resumo(dados: dict, manchetes: list, periodo: str):
 
 
 # ─────────────────────────────
-# Publicações (anti-overlap)
+# Publicações
 # ─────────────────────────────
-async def enviar_publicacoes(periodo: str, *, enviar_tg: bool = True):
+async def enviar_publicacoes(periodo: str, *, enviar_tg: bool = True) -> bool:
     if PUBLICACAO_LOCK.locked():
         await log_bot("Scheduler", "Ignorado: execução já em andamento (anti-overlap).")
-        return
+        return False
 
     async with PUBLICACAO_LOCK:
         dados = await coletar_dados()
         if not dados:
-            return
+            return False
 
         cot = await dolar_para_real_async()
-        manchetes = await _call_sync_or_async(news.noticias)
+        manchetes = await news.noticias(10)
 
-        canal_rel_id = _get_cfg_int("CANAL_ANALISE", 0)
-        canal_j_id = _get_cfg_int("CANAL_NOTICIAS", 0)
-
-        canal_rel = client.get_channel(canal_rel_id) if canal_rel_id > 0 else None
-        canal_j = client.get_channel(canal_j_id) if canal_j_id > 0 else None
+        canal_rel = client.get_channel(int(getattr(config, "CANAL_ANALISE", 0)))
+        canal_j = client.get_channel(int(getattr(config, "CANAL_NOTICIAS", 0)))
 
         if canal_rel:
             await canal_rel.send(embed=embed_relatorio(dados, cot))
         else:
             await log_bot("CANAL_ANALISE inválido", "Não encontrei canal de análise (ID errado?).")
 
-        if canal_j and _get_cfg_bool("NEWS_ATIVAS", True):
+        if canal_j and bool(getattr(config, "NEWS_ATIVAS", True)):
             await canal_j.send(embed=embed_jornal(manchetes, periodo))
         else:
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg:
             try:
-                ok = await _call_sync_or_async(telegram.enviar_telegram, telegram_resumo(dados, manchetes, periodo))
+                ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
                 if not ok:
                     await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
             except Exception as e:
-                await log_bot("Telegram", f"Erro ao enviar: {e}")
+                await log_bot("Telegram", f"{type(e).__name__}: {e}")
 
         if not manchetes:
             await log_bot("RSS vazio", "news.noticias() retornou lista vazia (pode ser temporário).")
 
+        return True
+
 
 # ─────────────────────────────
-# Slash Commands (somente 2)
+# Slash commands
 # ─────────────────────────────
 @tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_testetudo(interaction: discord.Interaction):
+    if not _admin_channel_ok(interaction):
+        await interaction.response.send_message("⚠️ Use este comando apenas no canal admin.", ephemeral=True)
+        return
+
     await interaction.response.defer(thinking=True)
-    await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
-    await interaction.followup.send("✅ Disparei todas as publicações (Discord + Telegram).", ephemeral=True)
+    ok = await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
+    if ok:
+        await interaction.followup.send("✅ Disparei todas as publicações (Discord + Telegram).", ephemeral=True)
+    else:
+        await interaction.followup.send("❌ Falhou ao buscar dados. Veja o canal de logs.", ephemeral=True)
 
 @tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_reiniciar(interaction: discord.Interaction):
+    if not _admin_channel_ok(interaction):
+        await interaction.response.send_message("⚠️ Use este comando apenas no canal admin.", ephemeral=True)
+        return
+
     await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
     await asyncio.sleep(1)
     global _FORCE_EXIT
@@ -440,7 +426,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ─────────────────────────────
-# Scheduler 06/18 BR
+# Scheduler 06/18
 # ─────────────────────────────
 @tasks.loop(minutes=1)
 async def scheduler():
@@ -458,8 +444,16 @@ async def scheduler():
 
 
 # ─────────────────────────────
-# Shutdown + Signals
+# Shutdown / Signals
 # ─────────────────────────────
+async def _close_http():
+    global HTTP
+    if HTTP is not None:
+        with contextlib.suppress(Exception):
+            if not HTTP.closed:
+                await HTTP.close()
+    HTTP = None
+
 async def shutdown(reason: str = "shutdown"):
     global _SHUTTING_DOWN
     if _SHUTTING_DOWN:
@@ -472,6 +466,9 @@ async def shutdown(reason: str = "shutdown"):
 
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
+
+    with contextlib.suppress(Exception):
+        await _close_http()
 
     with contextlib.suppress(Exception):
         await client.close()
@@ -494,14 +491,28 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# Ready + Sync
+# Ready + Session Injection + Sync
 # ─────────────────────────────
 @client.event
 async def on_ready():
-    global _TREE_SYNCED
+    global HTTP, _TREE_SYNCED
     print(f"🤖 Conectado como {client.user}")
 
-    # Sincroniza slash commands quando você quiser
+    # cria UMA sessão e injeta nos módulos (isso é o que estava faltando)
+    if HTTP is None:
+        timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+        connector = aiohttp.TCPConnector(
+            limit_per_host=MAX_CONCURRENCY,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
+        HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+        # ✅ essencial para teu market/news/telegram do ZIP
+        market.set_session(HTTP)
+        news.set_session(HTTP)
+        telegram.set_session(HTTP)
+
     if SYNC_COMMANDS and not _TREE_SYNCED:
         try:
             if GUILD_ID:
@@ -520,7 +531,7 @@ async def on_ready():
 
 
 # ─────────────────────────────
-# Entry point robusto
+# Entry point
 # ─────────────────────────────
 async def main():
     if not TOKEN:
@@ -528,8 +539,12 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    async with client:
-        await client.start(TOKEN)
+    try:
+        async with client:
+            await client.start(TOKEN)
+    finally:
+        with contextlib.suppress(Exception):
+            await _close_http()
 
 if __name__ == "__main__":
     try:
