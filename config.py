@@ -37,16 +37,55 @@ ATIVOS = {
     ],
 }
 
-# Trading V2
-TRADING_ENABLED = True
-TRADING_CHANNEL_ID = int(os.getenv("TRADING_CHANNEL_ID", "0") or "0")
-TRADING_CHANNEL_ONLY = True
+# ─────────────────────────────
+# Helpers robustos de ENV (não crasham)
+# ─────────────────────────────
+def env_str(name: str, default: str = "") -> str:
+    try:
+        v = os.getenv(name)
+        return v.strip() if v is not None else default
+    except Exception:
+        return default
 
-# Trading News (RSS)
-TRADING_NEWS_ATIVAS = os.getenv("TRADING_NEWS_ATIVAS", "1") == "1"
-TRADING_NEWS_TIMES = os.getenv("TRADING_NEWS_TIMES", "08:00,14:00,20:00")  # horários separados por vírgula
+def env_int(name: str, default: int = 0) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return default
+        v = v.strip()
+        if not v:
+            return default
+        return int(v)
+    except Exception:
+        return default
 
-# Resumo diário de trades
-TRADING_DAILY_SUMMARY_ATIVO = os.getenv("TRADING_DAILY_SUMMARY_ATIVO", "1") == "1"
-TRADING_DAILY_SUMMARY_TIME = os.getenv("TRADING_DAILY_SUMMARY_TIME", "21:00")  # HH:MM
+def env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return default
+        v = v.strip().lower()
+        return v in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return default
+
+# ─────────────────────────────
+# Trading V2 (safe defaults)
+# ─────────────────────────────
+TRADING_ENABLED = env_bool("TRADING_ENABLED", True)
+
+# se você não setar agora, fica 0 e o bot NÃO tenta postar no canal
+TRADING_CHANNEL_ID = env_int("TRADING_CHANNEL_ID", 0)
+
+# se TRADING_CHANNEL_ID = 0, a restrição fica "flexível" (não trava comandos)
+TRADING_CHANNEL_ONLY = env_bool("TRADING_CHANNEL_ONLY", True)
+
+# Trading News
+TRADING_NEWS_ATIVAS = env_bool("TRADING_NEWS_ATIVAS", False)
+TRADING_NEWS_TIMES = env_str("TRADING_NEWS_TIMES", "08:00,14:00,20:00")
+
+# Resumo diário
+TRADING_DAILY_SUMMARY_ATIVO = env_bool("TRADING_DAILY_SUMMARY_ATIVO", False)
+TRADING_DAILY_SUMMARY_TIME = env_str("TRADING_DAILY_SUMMARY_TIME", "21:00")
+
 
