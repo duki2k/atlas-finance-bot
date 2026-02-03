@@ -1,3 +1,5 @@
+import os
+
 # config.py
 
 CANAL_ADMIN = 1467296892256911493
@@ -34,8 +36,6 @@ ATIVOS = {
         "DIA", "IWM", "EFA", "VEA", "VNQ",
     ],
 }
-
-import os
 
 # Trading V2
 TRADING_ENABLED = True
