@@ -6,6 +6,8 @@ import pytz
 import aiohttp
 from datetime import datetime
 from discord.ext import commands, tasks
+from discord import app_commands
+from typing import Optional
 
 import config
 import market
@@ -15,8 +17,8 @@ import telegram
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
+# Slash commands NÃO precisam de message_content
 intents = discord.Intents.default()
-intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -29,7 +31,7 @@ ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
 
 # HTTP session + cache FX
-HTTP = None  # aiohttp.ClientSession
+HTTP: Optional[aiohttp.ClientSession] = None
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
@@ -39,6 +41,9 @@ PUBLICACAO_LOCK = asyncio.Lock()
 # Concorrência de coleta (ajuste via env no Railway: MAX_CONCURRENCY=6/8/10)
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
+
+# Sync do tree (não ficar rodando toda vez)
+_TREE_SYNCED = False
 
 
 # ─────────────────────────────
@@ -88,6 +93,43 @@ def ideias_em_baixa() -> str:
         "• Aportes em etapas (não tudo de uma vez)\n"
         "• Evite decisões por impulso"
     )
+
+def embed_menu_comandos() -> discord.Embed:
+    embed = discord.Embed(
+        title="🤖 Atlas Finance — Comandos (Admin)",
+        description="✅ Use `/` para ver sugestões automáticas.",
+        color=0x5865F2
+    )
+    embed.add_field(
+        name="🧪 Testes (canal atual)",
+        value=(
+            "`/testrelatorio` → envia relatório aqui\n"
+            "`/testjornal` → envia jornal aqui\n"
+            "`/testtudo` → relatório+jornal aqui (sem Telegram)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📌 Testes (canais oficiais)",
+        value="`/testarpublicacoes` → dispara nos canais oficiais + Telegram",
+        inline=False
+    )
+    embed.add_field(
+        name="📨 Testes (Telegram)",
+        value="`/testtelegram` → manda resumo no Telegram",
+        inline=False
+    )
+    embed.add_field(
+        name="🚨 Testes (Urgente)",
+        value="`/testrompimento` → simula alerta urgente no canal de notícias",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Sistema",
+        value="`/reiniciar` → reinicia o bot",
+        inline=False
+    )
+    return embed
 
 async def log_bot(titulo: str, mensagem: str):
     canal = bot.get_channel(config.CANAL_LOGS)
@@ -186,27 +228,22 @@ async def _fetch_one(categoria: str, ativo: str):
             return None
 
 async def coletar_dados():
-    tasks_list = []
+    coros = []
+    order = []
     for categoria, ativos in config.ATIVOS.items():
         for ativo in ativos:
-            tasks_list.append((_fetch_one(categoria, ativo), categoria))
+            coros.append(_fetch_one(categoria, ativo))
+            order.append((categoria, ativo))
 
-    results = await asyncio.gather(*[c for c, _ in tasks_list], return_exceptions=False)
+    results = await asyncio.gather(*coros, return_exceptions=False)
 
     dados = {}
-    idx = 0
     total = 0
-
-    for categoria, ativos in config.ATIVOS.items():
-        itens = []
-        for _ in ativos:
-            item = results[idx]
-            idx += 1
-            if item:
-                itens.append(item)
-        if itens:
-            dados[categoria] = itens
-            total += len(itens)
+    for (categoria, _), item in zip(order, results):
+        if not item:
+            continue
+        dados.setdefault(categoria, []).append(item)
+        total += 1
 
     if total == 0:
         await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
@@ -216,7 +253,7 @@ async def coletar_dados():
 
 
 # ─────────────────────────────
-# EMBEDS
+# EMBEDS + TELEGRAM
 # ─────────────────────────────
 
 def embed_relatorio(dados: dict, cot: float):
@@ -257,17 +294,17 @@ def embed_relatorio(dados: dict, cot: float):
     embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
     return embed
 
-def embed_jornal(manchetes: list[str], periodo: str):
+def embed_jornal(manchetes: list, periodo: str):
     embed = discord.Embed(
         title=f"🗞️ Jornal do Mercado — {periodo}",
-        description="🌍 Manchetes e impacto no mercado (mais leve, estilo jornal 😄)",
+        description="🌍 Manchetes e impacto no mercado 😄",
         color=0x00BFFF
     )
 
     if not manchetes:
         embed.add_field(
             name="⚠️ Sem manchetes agora",
-            value="O RSS retornou vazio neste momento. Tentaremos novamente no próximo ciclo.",
+            value="O RSS retornou vazio. Tentaremos novamente no próximo ciclo.",
             inline=False
         )
         embed.set_footer(text="Fonte: Google News RSS")
@@ -282,13 +319,13 @@ def embed_jornal(manchetes: list[str], periodo: str):
 
     embed.add_field(
         name="🧠 Leitura rápida",
-        value="• Considere o cenário macro (juros, inflação, dólar)\n• Evite impulso\n• Gestão de risco sempre ✅",
+        value="• Cenário macro (juros, inflação, dólar)\n• Gestão de risco sempre ✅",
         inline=False
     )
     embed.set_footer(text="Fonte: Google News RSS")
     return embed
 
-def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
+def telegram_resumo(dados: dict, manchetes: list, periodo: str):
     moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
 
     altas = sum(1 for _, _, v in moves if v > 0)
@@ -329,7 +366,7 @@ def telegram_resumo(dados: dict, manchetes: list[str], periodo: str):
 
 async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jornal_id=None, enviar_tg=True):
     if PUBLICACAO_LOCK.locked():
-        await log_bot("Scheduler", "Ignorado: já existe uma execução em andamento (anti-overlap).")
+        await log_bot("Scheduler", "Ignorado: execução já em andamento (anti-overlap).")
         return
 
     async with PUBLICACAO_LOCK:
@@ -356,19 +393,19 @@ async def enviar_publicacoes(periodo: str, *, canal_relatorio_id=None, canal_jor
         if enviar_tg:
             ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
             if not ok:
-                await log_bot("Telegram", "Falha ao enviar (verifique TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID).")
+                await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
 
         if not manchetes:
             await log_bot("RSS vazio", "news.noticias() retornou lista vazia (pode ser temporário).")
 
 
 # ─────────────────────────────
-# EVENTOS / COMANDOS
+# READY + SYNC SLASH COMMANDS
 # ─────────────────────────────
 
 @bot.event
 async def on_ready():
-    global HTTP
+    global HTTP, _TREE_SYNCED
     print(f"🤖 Conectado como {bot.user}")
 
     if HTTP is None:
@@ -380,131 +417,79 @@ async def on_ready():
         news.set_session(HTTP)
         telegram.set_session(HTTP)
 
+    # Sync de slash commands (pra aparecer no autocomplete /)
+    if not _TREE_SYNCED:
+        try:
+            gid = os.getenv("GUILD_ID")  # opcional, recomendado
+            if gid:
+                guild = discord.Object(id=int(gid))
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+                print(f"✅ Slash commands sincronizados no servidor {gid}")
+            else:
+                await bot.tree.sync()
+                print("✅ Slash commands sincronizados globalmente")
+            _TREE_SYNCED = True
+        except Exception as e:
+            print(f"⚠️ Falha ao sincronizar slash commands: {e}")
+
     if not scheduler.is_running():
         scheduler.start()
 
-@bot.event
-async def on_message(message: discord.Message):
-    """
-    Discord NÃO sugere comandos automaticamente para prefixo '!'.
-    Então: se você ENVIAR apenas '!', o bot responde com a lista de comandos.
-    """
-    if message.author.bot:
-        return
 
-    if message.content.strip() == "!":
-        if message.guild and message.author.guild_permissions.administrator:
-            ctx = await bot.get_context(message)
-            await comandos(ctx)
-        else:
-            try:
-                await message.channel.send("❌ Você não tem permissão para ver os comandos.")
-            except Exception:
-                pass
-        return
+# ─────────────────────────────
+# SLASH COMMANDS (/)
+# ─────────────────────────────
 
-    await bot.process_commands(message)
+@bot.tree.command(name="comandos", description="Mostra o menu de comandos (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_comandos(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=embed_menu_comandos(), ephemeral=True)
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Você não tem permissão para usar este comando.")
-        return
-    await log_bot("Erro em comando", str(error))
-
-
-@bot.command(name="comandos", aliases=["help", "ajuda"])
-@commands.has_permissions(administrator=True)
-async def comandos(ctx):
-    embed = discord.Embed(
-        title="🤖 Atlas Finance — Comandos (Admin)",
-        description="Digite `!` (apenas !) para ver este menu rapidamente ✅",
-        color=0x5865F2
-    )
-    embed.add_field(
-        name="🧪 Testes (Discord no canal atual)",
-        value=(
-            "`!testrelatorio` → envia relatório aqui\n"
-            "`!testjornal` → envia jornal aqui\n"
-            "`!testtudo` → relatório+jornal aqui (sem mexer nos canais oficiais)"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="📌 Testes (canais oficiais)",
-        value="`!testarpublicacoes` → dispara nos canais oficiais + Telegram",
-        inline=False
-    )
-    embed.add_field(
-        name="📨 Testes (Telegram)",
-        value="`!testtelegram` → manda resumo no Telegram",
-        inline=False
-    )
-    embed.add_field(
-        name="🚨 Testes (Urgente)",
-        value="`!testrompimento` → simula alerta urgente no canal de notícias",
-        inline=False
-    )
-    embed.add_field(
-        name="⚙️ Sistema",
-        value="`!reiniciar` → reinicia o bot",
-        inline=False
-    )
-    await ctx.send(embed=embed)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testrelatorio(ctx):
-    await ctx.send("🧪 Gerando relatório aqui...")
+@bot.tree.command(name="testrelatorio", description="Gera relatório no canal atual (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testrelatorio(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     dados = await coletar_dados()
     if not dados:
-        await ctx.send("❌ Não consegui coletar dados.")
+        await interaction.followup.send("❌ Não consegui coletar dados.")
         return
     cot = await dolar_para_real_async()
-    await ctx.send(embed=embed_relatorio(dados, cot))
+    await interaction.followup.send(embed=embed_relatorio(dados, cot))
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testjornal(ctx):
-    await ctx.send("🧪 Gerando jornal aqui...")
+@bot.tree.command(name="testjornal", description="Gera jornal no canal atual (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testjornal(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     manchetes = await news.noticias()
-    try:
-        await ctx.send(embed=embed_jornal(manchetes, "Teste (canal atual)"))
-    except discord.Forbidden:
-        await ctx.send("⚠️ Falta permissão **Embed Links** neste canal. Vou mandar em texto:")
-        await ctx.send("\n".join([f"📰 {m}" for m in manchetes[:10]]) if manchetes else "Sem manchetes.")
-        await log_bot("Permissão", f"Faltando Embed Links no canal {ctx.channel.id}")
+    await interaction.followup.send(embed=embed_jornal(manchetes, "Teste (canal atual)"))
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testtudo(ctx):
-    await ctx.send("🧪 Enviando relatório + jornal neste canal (sem Telegram)...")
-    await enviar_publicacoes(
-        "Teste (canal atual)",
-        canal_relatorio_id=ctx.channel.id,
-        canal_jornal_id=ctx.channel.id,
-        enviar_tg=False
-    )
-    await ctx.send("✅ OK")
+@bot.tree.command(name="testtudo", description="Relatório + jornal no canal atual (sem Telegram) (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testtudo(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    canal_id = interaction.channel_id
+    await enviar_publicacoes("Teste (canal atual)", canal_relatorio_id=canal_id, canal_jornal_id=canal_id, enviar_tg=False)
+    await interaction.followup.send("✅ OK")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testtelegram(ctx):
-    await ctx.send("🧪 Enviando teste no Telegram...")
+@bot.tree.command(name="testtelegram", description="Envia um resumo para o Telegram (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testtelegram(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     dados = await coletar_dados()
     if not dados:
-        await ctx.send("❌ Não consegui coletar dados.")
+        await interaction.followup.send("❌ Não consegui coletar dados.")
         return
     manchetes = await news.noticias()
     ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, "Teste Telegram"))
-    await ctx.send("✅ Telegram enviado" if ok else "❌ Falha no Telegram (token/chat_id)")
+    await interaction.followup.send("✅ Telegram enviado" if ok else "❌ Falha no Telegram (token/chat_id)")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testrompimento(ctx):
+@bot.tree.command(name="testrompimento", description="Simula alerta urgente (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testrompimento(interaction: discord.Interaction):
     canal = bot.get_channel(config.CANAL_NOTICIAS)
     if not canal:
-        await ctx.send("❌ CANAL_NOTICIAS inválido.")
+        await interaction.response.send_message("❌ CANAL_NOTICIAS inválido.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -517,19 +502,19 @@ async def testrompimento(ctx):
     embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
 
     await canal.send(embed=embed)
-    await ctx.send("✅ Rompimento teste enviado no canal de notícias")
+    await interaction.response.send_message("✅ Enviado no canal de notícias.", ephemeral=True)
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def testarpublicacoes(ctx):
-    await ctx.send("🧪 Disparando publicações nos canais oficiais + Telegram...")
+@bot.tree.command(name="testarpublicacoes", description="Dispara nos canais oficiais + Telegram (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testarpublicacoes(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     await enviar_publicacoes("Teste Manual")
-    await ctx.send("✅ Teste finalizado")
+    await interaction.followup.send("✅ Teste finalizado")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def reiniciar(ctx):
-    await ctx.send("🔄 Reiniciando bot...")
+@bot.tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_reiniciar(interaction: discord.Interaction):
+    await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
     await asyncio.sleep(2)
 
     global HTTP
@@ -538,6 +523,17 @@ async def reiniciar(ctx):
         HTTP = None
 
     await bot.close()
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ Você não tem permissão para usar este comando."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+    await log_bot("Erro em slash command", str(error))
 
 
 # ─────────────────────────────
