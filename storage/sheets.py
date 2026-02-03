@@ -1,132 +1,238 @@
-# storage/sheets.py
 import os
 import json
 import base64
 import asyncio
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+DEFAULT_TAB = "Trades"
+
+HEADER = [
+    "trade_id",
+    "created_at",
+    "created_by",
+    "channel_id",
+    "message_id",
+    "asset",
+    "side",
+    "timeframe",
+    "entry",
+    "stop",
+    "tp1",
+    "tp2",
+    "status",
+    "closed_at",
+    "closed_by",
+    "outcome",
+    "exit_price",
+    "r_multiple",
+    "notes",
+]
 
 
 class SheetsStore:
-    def __init__(self, spreadsheet_id: str, creds_info: dict, tab_trades: str = "trades"):
+    def __init__(self, spreadsheet_id: str, service_account_b64: str, tab_name: str = DEFAULT_TAB):
         self.spreadsheet_id = spreadsheet_id
-        self.tab_trades = tab_trades
-
-        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-        self._svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        self.service_account_b64 = service_account_b64
+        self.tab_name = tab_name
+        self._service = None
 
     @classmethod
-    def from_env(cls) -> Optional["SheetsStore"]:
-        sid = os.getenv("GOOGLE_SHEET_ID", "").strip()
-        b64 = os.getenv("GOOGLE_SA_B64", "").strip()
+    def from_env(cls) -> "SheetsStore":
+        sid = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
+        tab = os.getenv("SHEETS_TRADES_TAB", DEFAULT_TAB).strip() or DEFAULT_TAB
 
+        # Se não tiver config, cria "desabilitado" (sem quebrar o bot)
         if not sid or not b64:
-            return None
+            return cls("", "", tab)
 
-        try:
-            raw = base64.b64decode(b64.encode("utf-8"))
-            info = json.loads(raw.decode("utf-8"))
-            return cls(spreadsheet_id=sid, creds_info=info)
-        except Exception:
-            return None
+        return cls(sid, b64, tab)
 
-    async def _to_thread(self, fn, *args, **kwargs):
-        return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+    def enabled(self) -> bool:
+        return bool(self.spreadsheet_id and self.service_account_b64)
 
-    async def ensure_tab(self):
-        """Cria a aba trades se não existir (não quebra se já existir)."""
-        def _run():
-            ss = self._svc.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
-            sheets = ss.get("sheets", [])
-            names = {s.get("properties", {}).get("title") for s in sheets}
-            if self.tab_trades in names:
+    def _get_service(self):
+        if self._service is not None:
+            return self._service
+
+        raw = base64.b64decode(self.service_account_b64.encode("utf-8"))
+        info = json.loads(raw.decode("utf-8"))
+
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+
+        self._service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        return self._service
+
+    async def ensure_header(self) -> bool:
+        if not self.enabled():
+            return False
+
+        def _sync():
+            svc = self._get_service()
+            rng = f"{self.tab_name}!A1:S1"
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=rng
+            ).execute()
+            vals = resp.get("values", [])
+
+            if vals and vals[0] and vals[0][: len(HEADER)] == HEADER:
                 return True
 
-            req = {"requests": [{"addSheet": {"properties": {"title": self.tab_trades}}}]}
-            self._svc.spreadsheets().batchUpdate(
+            body = {"values": [HEADER]}
+            svc.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
-                body=req
+                range=rng,
+                valueInputOption="RAW",
+                body=body,
             ).execute()
             return True
 
-        return await self._to_thread(_run)
+        return await asyncio.to_thread(_sync)
 
-    async def append_trade(self, row: List[Any]) -> bool:
-        """Append uma linha na aba trades."""
-        def _run():
-            body = {"values": [row]}
-            self._svc.spreadsheets().values().append(
+    async def append_trade(self, row: Dict[str, Any]) -> bool:
+        if not self.enabled():
+            return False
+
+        await self.ensure_header()
+
+        values = [[
+            row.get("trade_id", ""),
+            row.get("created_at", ""),
+            row.get("created_by", ""),
+            str(row.get("channel_id", "")),
+            str(row.get("message_id", "")),
+            row.get("asset", ""),
+            row.get("side", ""),
+            row.get("timeframe", ""),
+            row.get("entry", ""),
+            row.get("stop", ""),
+            row.get("tp1", ""),
+            row.get("tp2", ""),
+            row.get("status", "OPEN"),
+            row.get("closed_at", ""),
+            row.get("closed_by", ""),
+            row.get("outcome", ""),
+            row.get("exit_price", ""),
+            row.get("r_multiple", ""),
+            row.get("notes", ""),
+        ]]
+
+        def _sync():
+            svc = self._get_service()
+            rng = f"{self.tab_name}!A:S"
+            body = {"values": values}
+            svc.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.tab_trades}!A1",
+                range=rng,
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
                 body=body,
             ).execute()
             return True
 
-        try:
-            return await self._to_thread(_run)
-        except Exception:
-            return False
+        return await asyncio.to_thread(_sync)
 
-    async def get_all_trades(self) -> List[List[str]]:
-        """Lê todas as linhas da aba trades."""
-        def _run():
-            resp = self._svc.spreadsheets().values().get(
+    async def find_trade_row(self, trade_id: str) -> Optional[int]:
+        """
+        Retorna o número da linha (1-indexed) onde está o trade_id.
+        """
+        if not self.enabled():
+            return None
+
+        def _sync():
+            svc = self._get_service()
+            rng = f"{self.tab_name}!A:A"
+            resp = svc.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.tab_trades}!A:Z"
+                range=rng
             ).execute()
-            return resp.get("values", [])
+            values = resp.get("values", [])
+            for idx, row in enumerate(values, start=1):
+                if row and row[0].strip() == trade_id.strip():
+                    return idx
+            return None
 
-        return await self._to_thread(_run)
+        return await asyncio.to_thread(_sync)
 
-    async def find_trade_row(self, trade_id: str) -> Tuple[Optional[int], Optional[List[str]], Optional[List[str]]]:
-        """
-        Retorna: (row_index_1based, header, row)
-        row_index_1based: número da linha na planilha (1 = header)
-        """
-        values = await self.get_all_trades()
-        if not values or len(values) < 2:
-            return None, None, None
-
-        header = values[0]
-        for idx, row in enumerate(values[1:], start=2):
-            if len(row) > 0 and row[0] == trade_id:
-                return idx, header, row
-        return None, header, None
-
-    async def update_trade_by_id(self, trade_id: str, updates: Dict[str, Any]) -> bool:
-        """
-        Atualiza colunas específicas na linha do trade.
-        updates: {col_name: value}
-        """
-        row_idx, header, row = await self.find_trade_row(trade_id)
-        if not row_idx or not header:
+    async def close_trade(
+        self,
+        trade_id: str,
+        closed_at: str,
+        closed_by: str,
+        outcome: str,
+        exit_price: str,
+        r_multiple: str,
+        notes: str = "",
+    ) -> bool:
+        if not self.enabled():
             return False
 
-        row = row or []
-        row = row + [""] * (len(header) - len(row))
+        row_idx = await self.find_trade_row(trade_id)
+        if not row_idx or row_idx <= 1:
+            return False
 
-        col_map = {name: i for i, name in enumerate(header)}
-        for k, v in updates.items():
-            if k in col_map:
-                row[col_map[k]] = "" if v is None else str(v)
+        # Colunas:
+        # M=status, N=closed_at, O=closed_by, P=outcome, Q=exit_price, R=r_multiple, S=notes
+        def _sync():
+            svc = self._get_service()
 
-        def _run():
-            body = {"values": [row]}
-            self._svc.spreadsheets().values().update(
+            update_range = f"{self.tab_name}!M{row_idx}:S{row_idx}"
+            values = [[
+                "CLOSED",
+                closed_at,
+                closed_by,
+                outcome,
+                exit_price,
+                r_multiple,
+                notes,
+            ]]
+
+            body = {"values": values}
+            svc.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{self.tab_trades}!A{row_idx}:Z{row_idx}",
+                range=update_range,
                 valueInputOption="USER_ENTERED",
                 body=body
             ).execute()
             return True
 
-        try:
-            return await self._to_thread(_run)
-        except Exception:
-            return False
+        return await asyncio.to_thread(_sync)
+
+    async def list_trades(self, status: str = "OPEN", limit: int = 20) -> List[Dict[str, Any]]:
+        if not self.enabled():
+            return []
+
+        def _sync():
+            svc = self._get_service()
+            rng = f"{self.tab_name}!A:S"
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=rng
+            ).execute()
+            values = resp.get("values", [])
+            if len(values) < 2:
+                return []
+
+            header = values[0]
+            rows = values[1:]
+
+            out = []
+            for r in rows:
+                obj = {header[i]: (r[i] if i < len(r) else "") for i in range(len(header))}
+                if status and obj.get("status", "").upper() != status.upper():
+                    continue
+                out.append(obj)
+
+            out = out[-limit:]  # últimos
+            out.reverse()       # mais recente primeiro
+            return out
+
+        return await asyncio.to_thread(_sync)
