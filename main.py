@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import signal
 import contextlib
-import warnings
+import logging
 import discord
 import pytz
 import aiohttp
@@ -24,44 +24,56 @@ from commands.trading import register_trading_commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-# 🔇 Evita poluir logs com warning do aiohttp em shutdown rápido (Railway/discord)
-warnings.filterwarnings("ignore", message="Unclosed connector")
-warnings.filterwarnings("ignore", message="Unclosed client session")
+# ─────────────────────────────
+# LOGGING (mata o spam do aiohttp "Unclosed connector")
+# ─────────────────────────────
+logging.basicConfig(level=logging.INFO)
 
+# O aviso que você está vendo vem normalmente daqui:
+logging.getLogger("aiohttp.connector").setLevel(logging.CRITICAL)
+logging.getLogger("aiohttp.client").setLevel(logging.CRITICAL)
+logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
+
+# ─────────────────────────────
+# DISCORD CLIENT
+# ─────────────────────────────
 intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-# HTTP session (sua) + cache FX
-HTTP: Optional[aiohttp.ClientSession] = None
+# ─────────────────────────────
+# Trading + Sheets
+# ─────────────────────────────
+store = SheetsStore.from_env()
+register_trading_commands(tree, store, client)
+
+# ─────────────────────────────
+# Globals
+# ─────────────────────────────
+HTTP: Optional[aiohttp.ClientSession] = None  # sua sessão
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
-# Locks anti-overlap
 PUBLICACAO_LOCK = asyncio.Lock()
 
-# Concorrência de coleta
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
-# Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
 
-# Rompimento
 ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
 
-# Sync do tree
 _TREE_SYNCED = False
-
-# Shutdown guards
 _SHUTTING_DOWN = False
-_FORCE_EXIT = False
+_FORCE_EXIT = False  # quando true, sai do processo após shutdown
+_FORCE_EXIT_ON_SIGNAL = True  # para Railway parar/redeploy sem enrolar
 
 
 # ─────────────────────────────
-# HELPERS: compat (sync/async)
+# Helpers (sync/async compat)
 # ─────────────────────────────
-
 async def _maybe_await(x: Any):
     if inspect.isawaitable(x):
         return await x
@@ -74,21 +86,8 @@ async def _call_sync_or_async(fn, *args, **kwargs):
 
 
 # ─────────────────────────────
-# CLIENT + COMMAND TREE
+# Util
 # ─────────────────────────────
-
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# Sheets + trading commands
-store = SheetsStore.from_env()
-register_trading_commands(tree, store, client)
-
-
-# ─────────────────────────────
-# UTIL
-# ─────────────────────────────
-
 def emoji_var(v: float) -> str:
     if v is None:
         return "⏺️"
@@ -167,9 +166,8 @@ async def dolar_para_real_async() -> float:
 
 
 # ─────────────────────────────
-# SHUTDOWN / SIGNALS
+# Shutdown
 # ─────────────────────────────
-
 async def _close_http():
     global HTTP
     if HTTP is not None:
@@ -178,21 +176,13 @@ async def _close_http():
                 await HTTP.close()
     HTTP = None
 
-async def _cancel_pending_tasks():
-    current = asyncio.current_task()
-    pending = [t for t in asyncio.all_tasks() if t is not current]
-    for t in pending:
-        t.cancel()
-    with contextlib.suppress(Exception):
-        await asyncio.gather(*pending, return_exceptions=True)
-
 async def shutdown(reason: str = "shutdown"):
     global _SHUTTING_DOWN
     if _SHUTTING_DOWN:
         return
     _SHUTTING_DOWN = True
 
-    # parar scheduler cedo (não iniciar novas coisas)
+    # Para scheduler antes de qualquer coisa
     with contextlib.suppress(Exception):
         if scheduler.is_running():
             scheduler.cancel()
@@ -200,25 +190,34 @@ async def shutdown(reason: str = "shutdown"):
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
-    # fechar sua sessão HTTP
+    # Fecha sua sessão
     with contextlib.suppress(Exception):
         await asyncio.wait_for(_close_http(), timeout=5)
 
-    # fechar discord (fecha o aiohttp interno do discord.py)
+    # Fecha discord (fecha aiohttp interno do discord.py)
     with contextlib.suppress(Exception):
         await asyncio.wait_for(client.close(), timeout=8)
 
-    # evita warnings ao fechar o loop
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(_cancel_pending_tasks(), timeout=3)
-
-    # 🚀 Restart rápido no Railway (encerra o processo pra plataforma subir de novo)
+    # Hard-exit (Railway) quando solicitado
     if _FORCE_EXIT:
         os._exit(0)
 
+
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
+    """
+    Railway manda SIGTERM no redeploy/stop. A gente finaliza rápido.
+    """
     def _handler(sig_name: str):
-        asyncio.create_task(shutdown(sig_name))
+        async def _go():
+            global _FORCE_EXIT
+            if _FORCE_EXIT_ON_SIGNAL:
+                _FORCE_EXIT = True
+            await shutdown(sig_name)
+            # Se por algum motivo não saiu ainda:
+            if _FORCE_EXIT_ON_SIGNAL:
+                os._exit(0)
+
+        asyncio.create_task(_go())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
@@ -226,9 +225,8 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# ALERTA (ROMPIMENTO)
+# Rompimento
 # ─────────────────────────────
-
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
     canal = client.get_channel(config.CANAL_NOTICIAS)
     if not canal:
@@ -261,9 +259,8 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
 
 # ─────────────────────────────
-# COLETA CONCORRENTE
+# Coleta concorrente
 # ─────────────────────────────
-
 async def _dados_ativo_async(ativo: str):
     if not hasattr(market, "dados_ativo"):
         return None, None
@@ -319,12 +316,10 @@ async def coletar_dados():
 
 
 # ─────────────────────────────
-# EMBEDS + TELEGRAM
+# Embeds + Telegram
 # ─────────────────────────────
-
 def embed_relatorio(dados: dict, cot: float):
-    moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
-
+    moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
     sent_label, cor = sentimento_geral(altas, quedas)
@@ -392,8 +387,7 @@ def embed_jornal(manchetes: list, periodo: str):
     return embed
 
 def telegram_resumo(dados: dict, manchetes: list, periodo: str):
-    moves = [(ativo, preco, var) for itens in dados.values() for (ativo, preco, var) in itens]
-
+    moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
     sent_label, _ = sentimento_geral(altas, quedas)
@@ -401,35 +395,34 @@ def telegram_resumo(dados: dict, manchetes: list, periodo: str):
     top_alta = sorted(moves, key=lambda x: x[2], reverse=True)[:3]
     top_baixa = sorted(moves, key=lambda x: x[2])[:3]
 
-    linhas = []
-    linhas.append(f"📊 Resumo do Mercado — {periodo}")
-    linhas.append(f"{sent_label}")
-    linhas.append("")
-    linhas.append(texto_cenario(sent_label))
-    linhas.append("")
-    linhas.append("🔝 Top 3 Altas")
-    linhas.extend([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_alta] or ["- —"])
-    linhas.append("")
-    linhas.append("🔻 Top 3 Quedas")
-    linhas.extend([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_baixa] or ["- —"])
-    linhas.append("")
-    linhas.append("🌍 Manchetes do Mundo")
+    linhas = [
+        f"📊 Resumo do Mercado — {periodo}",
+        f"{sent_label}",
+        "",
+        texto_cenario(sent_label),
+        "",
+        "🔝 Top 3 Altas",
+        *([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_alta] or ["- —"]),
+        "",
+        "🔻 Top 3 Quedas",
+        *([f"- {a} {emoji_var(v)} {v:.2f}%" for a, _, v in top_baixa] or ["- —"]),
+        "",
+        "🌍 Manchetes do Mundo",
+    ]
+
     if manchetes:
         for m in manchetes[:6]:
             linhas.append(f"📰 {m}")
     else:
         linhas.append("📰 (sem manchetes disponíveis agora)")
-    linhas.append("")
-    linhas.append(ideias_em_baixa())
-    linhas.append("")
-    linhas.append("— Atlas Finance")
+
+    linhas += ["", ideias_em_baixa(), "", "— Atlas Finance"]
     return "\n".join(linhas)
 
 
 # ─────────────────────────────
-# PUBLICAÇÕES (COM LOCK)
+# Publicações (lock)
 # ─────────────────────────────
-
 async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
     if PUBLICACAO_LOCK.locked():
         await log_bot("Scheduler", "Ignorado: execução já em andamento (anti-overlap).")
@@ -466,9 +459,8 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
 
 
 # ─────────────────────────────
-# READY + SYNC SLASH COMMANDS
+# READY + SYNC
 # ─────────────────────────────
-
 @client.event
 async def on_ready():
     global HTTP, _TREE_SYNCED
@@ -483,6 +475,7 @@ async def on_ready():
         )
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
+        # Se seus módulos tiverem set_session, injeta (não quebra se não tiver)
         for mod in (market, news, telegram):
             if hasattr(mod, "set_session"):
                 with contextlib.suppress(Exception):
@@ -508,9 +501,8 @@ async def on_ready():
 
 
 # ─────────────────────────────
-# SLASH COMMANDS (mantidos)
+# Slash commands (mantidos)
 # ─────────────────────────────
-
 @tree.command(
     name="testetudo",
     description="Testa todas as publicações oficiais (Relatório + Jornal + Telegram) (Admin)"
@@ -544,9 +536,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ─────────────────────────────
-# SCHEDULER (06h / 18h) — BRASIL
+# Scheduler 06/18
 # ─────────────────────────────
-
 @tasks.loop(minutes=1)
 async def scheduler():
     global ultima_manha, ultima_tarde
@@ -563,9 +554,8 @@ async def scheduler():
 
 
 # ─────────────────────────────
-# ENTRYPOINT ROBUSTO (discord.py cleanup)
+# Entry point robusto
 # ─────────────────────────────
-
 async def main():
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN não definido.")
@@ -573,21 +563,13 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    # ✅ forma mais robusta: garante cleanup do aiohttp interno do discord.py
+    # ✅ garante cleanup interno do discord.py
     try:
         async with client:
             await client.start(TOKEN)
     finally:
         with contextlib.suppress(Exception):
             await _close_http()
-
-def install_signal_handlers(loop: asyncio.AbstractEventLoop):
-    def _handler(sig_name: str):
-        asyncio.create_task(shutdown(sig_name))
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _handler, sig.name)
 
 if __name__ == "__main__":
     try:
