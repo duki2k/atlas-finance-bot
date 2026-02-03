@@ -11,7 +11,7 @@ import aiohttp
 from datetime import datetime
 from discord.ext import tasks
 from discord import app_commands
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 
 import config
 import market
@@ -28,8 +28,6 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 # LOGGING (mata o spam do aiohttp "Unclosed connector")
 # ─────────────────────────────
 logging.basicConfig(level=logging.INFO)
-
-# O aviso que você está vendo vem normalmente daqui:
 logging.getLogger("aiohttp.connector").setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp.client").setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
@@ -50,7 +48,7 @@ register_trading_commands(tree, store, client)
 # ─────────────────────────────
 # Globals
 # ─────────────────────────────
-HTTP: Optional[aiohttp.ClientSession] = None  # sua sessão
+HTTP: Optional[aiohttp.ClientSession] = None
 _FX_CACHE = {"rate": 5.0, "ts": 0.0}
 _FX_TTL = 600  # 10 min
 
@@ -62,13 +60,18 @@ SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 ultima_manha = None
 ultima_tarde = None
 
-ULTIMO_PRECO = {}      # {ativo: preco}
-FALHAS_SEGUIDAS = {}   # {ativo: count}
+# trading jobs: controle pra não disparar 2x por dia/horário
+_ultima_trading_news: Dict[str, Any] = {}  # {"08:00": date, ...}
+_ultima_trading_resumo = None
+
+# market alert
+ULTIMO_PRECO = {}
+FALHAS_SEGUIDAS = {}
 
 _TREE_SYNCED = False
 _SHUTTING_DOWN = False
-_FORCE_EXIT = False  # quando true, sai do processo após shutdown
-_FORCE_EXIT_ON_SIGNAL = True  # para Railway parar/redeploy sem enrolar
+_FORCE_EXIT = False
+_FORCE_EXIT_ON_SIGNAL = True
 
 
 # ─────────────────────────────
@@ -132,12 +135,24 @@ def ideias_em_baixa() -> str:
         "• Evite decisões por impulso"
     )
 
+def _now_br() -> str:
+    return datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
+
+def _parse_times_csv(s: str) -> List[str]:
+    out = []
+    for x in (s or "").split(","):
+        x = x.strip()
+        if len(x) == 5 and x[2] == ":":
+            out.append(x)
+    return out
+
+
 async def log_bot(titulo: str, mensagem: str):
     canal = client.get_channel(config.CANAL_LOGS)
     if not canal:
         return
     embed = discord.Embed(title=f"📋 {titulo}", description=mensagem, color=0xE67E22)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
+    embed.set_footer(text=_now_br())
     await canal.send(embed=embed)
 
 async def dolar_para_real_async() -> float:
@@ -182,7 +197,6 @@ async def shutdown(reason: str = "shutdown"):
         return
     _SHUTTING_DOWN = True
 
-    # Para scheduler antes de qualquer coisa
     with contextlib.suppress(Exception):
         if scheduler.is_running():
             scheduler.cancel()
@@ -190,33 +204,24 @@ async def shutdown(reason: str = "shutdown"):
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
-    # Fecha sua sessão
     with contextlib.suppress(Exception):
         await asyncio.wait_for(_close_http(), timeout=5)
 
-    # Fecha discord (fecha aiohttp interno do discord.py)
     with contextlib.suppress(Exception):
         await asyncio.wait_for(client.close(), timeout=8)
 
-    # Hard-exit (Railway) quando solicitado
     if _FORCE_EXIT:
         os._exit(0)
 
-
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
-    """
-    Railway manda SIGTERM no redeploy/stop. A gente finaliza rápido.
-    """
     def _handler(sig_name: str):
         async def _go():
             global _FORCE_EXIT
             if _FORCE_EXIT_ON_SIGNAL:
                 _FORCE_EXIT = True
             await shutdown(sig_name)
-            # Se por algum motivo não saiu ainda:
             if _FORCE_EXIT_ON_SIGNAL:
                 os._exit(0)
-
         asyncio.create_task(_go())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -253,7 +258,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
     embed.add_field(name="Preço anterior", value=f"{preco_antigo:,.4f}", inline=True)
     embed.add_field(name="Preço atual", value=f"{preco_atual:,.4f}", inline=True)
     embed.add_field(name="Movimento", value=f"{var:+.2f}% {emoji_var(var)}", inline=False)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
+    embed.set_footer(text=_now_br())
 
     await canal.send(embed=embed)
 
@@ -352,7 +357,7 @@ def embed_relatorio(dados: dict, cot: float):
         embed.add_field(name=categoria, value="\n".join(linhas), inline=False)
 
     embed.add_field(name="💡 Dica do dia", value=ideias_em_baixa(), inline=False)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
+    embed.set_footer(text=_now_br())
     return embed
 
 def embed_jornal(manchetes: list, periodo: str):
@@ -421,6 +426,120 @@ def telegram_resumo(dados: dict, manchetes: list, periodo: str):
 
 
 # ─────────────────────────────
+# Trading V2: News + Resumo diário
+# ─────────────────────────────
+TRADING_RSS_URL = (
+    "https://news.google.com/rss/search"
+    "?q=trading+mercado+juros+fomc+cpi+payroll+earnings+dolar+inflacao+wall+street"
+    "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+)
+
+def embed_trading_news(manchetes: List[str], titulo: str):
+    e = discord.Embed(
+        title=f"📡 {titulo}",
+        description="🧠 Manchetes focadas em *trading* (macro/eventos).",
+        color=0x9B59B6
+    )
+    if not manchetes:
+        e.add_field(name="Sem manchetes agora", value="RSS retornou vazio. Tentaremos no próximo horário.", inline=False)
+        return e
+
+    bloco = "\n".join([f"• {m}" for m in manchetes[:10]])
+    e.add_field(name="Manchetes", value=bloco[:3800], inline=False)
+    e.set_footer(text="Fonte: Google News RSS (trading) | Educacional")
+    return e
+
+async def pegar_manchetes_trading() -> List[str]:
+    # feedparser é sync; roda em thread pra não travar
+    def _sync():
+        try:
+            import feedparser
+            feed = feedparser.parse(TRADING_RSS_URL)
+            if not getattr(feed, "entries", None):
+                return []
+            out = []
+            for entry in feed.entries[:10]:
+                t = getattr(entry, "title", "")
+                if t:
+                    out.append(t.strip())
+            return out
+        except Exception:
+            return []
+    return await asyncio.to_thread(_sync)
+
+async def postar_trading_news(label: str):
+    if not getattr(config, "TRADING_NEWS_ATIVAS", True):
+        return
+    chan_id = int(getattr(config, "TRADING_CHANNEL_ID", 0) or 0)
+    if not chan_id:
+        await log_bot("Trading", "TRADING_CHANNEL_ID não configurado.")
+        return
+    canal = client.get_channel(chan_id)
+    if not canal:
+        await log_bot("Trading", f"Canal trading inválido: {chan_id}")
+        return
+
+    manchetes = await pegar_manchetes_trading()
+    await canal.send(embed=embed_trading_news(manchetes, f"Trading News — {label}"))
+    if not manchetes:
+        await log_bot("Trading RSS vazio", "Trading RSS retornou vazio (pode ser temporário).")
+
+async def postar_resumo_trading(label: str):
+    if not getattr(config, "TRADING_DAILY_SUMMARY_ATIVO", True):
+        return
+    chan_id = int(getattr(config, "TRADING_CHANNEL_ID", 0) or 0)
+    if not chan_id:
+        await log_bot("Trading", "TRADING_CHANNEL_ID não configurado (resumo).")
+        return
+    canal = client.get_channel(chan_id)
+    if not canal:
+        await log_bot("Trading", f"Canal trading inválido: {chan_id}")
+        return
+
+    if not hasattr(store, "list_trades") or not getattr(store, "enabled", lambda: False)():
+        await log_bot("Trading", "SheetsStore desativado (sem SHEETS_SPREADSHEET_ID/GOOGLE_SERVICE_ACCOUNT_B64).")
+        return
+
+    closed = await store.list_trades(status="CLOSED", limit=300)
+    open_ = await store.list_trades(status="OPEN", limit=300)
+
+    total = len(closed)
+    greens = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "GREEN")
+    reds = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "RED")
+    bes = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "BE")
+
+    def _to_float(x):
+        try:
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return None
+
+    rs = []
+    for t in closed:
+        r = _to_float(t.get("r_multiple", ""))
+        if r is not None:
+            rs.append(r)
+
+    winrate = (greens / total * 100.0) if total else 0.0
+    avg_r = (sum(rs) / len(rs)) if rs else 0.0
+
+    cor = 0x2ECC71 if winrate >= 50 else 0xE74C3C
+    e = discord.Embed(
+        title=f"🧾 Resumo de Trades — {label}",
+        description="⚠️ Paper/Educacional. Não é recomendação.",
+        color=cor
+    )
+    e.add_field(name="OPEN", value=str(len(open_)), inline=True)
+    e.add_field(name="CLOSED", value=str(total), inline=True)
+    e.add_field(name="Winrate", value=f"{winrate:.1f}%", inline=True)
+    e.add_field(name="GREEN / RED / BE", value=f"{greens} / {reds} / {bes}", inline=False)
+    e.add_field(name="Média de R", value=f"{avg_r:.3f}" if rs else "—", inline=True)
+    e.set_footer(text=_now_br())
+
+    await canal.send(embed=e)
+
+
+# ─────────────────────────────
 # Publicações (lock)
 # ─────────────────────────────
 async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
@@ -475,7 +594,6 @@ async def on_ready():
         )
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-        # Se seus módulos tiverem set_session, injeta (não quebra se não tiver)
         for mod in (market, news, telegram):
             if hasattr(mod, "set_session"):
                 with contextlib.suppress(Exception):
@@ -501,7 +619,7 @@ async def on_ready():
 
 
 # ─────────────────────────────
-# Slash commands (mantidos)
+# Slash commands
 # ─────────────────────────────
 @tree.command(
     name="testetudo",
@@ -518,10 +636,23 @@ async def slash_testetudo(interaction: discord.Interaction):
 async def slash_reiniciar(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
     await asyncio.sleep(1)
-
     global _FORCE_EXIT
     _FORCE_EXIT = True
     await shutdown("manual restart")
+
+@tree.command(name="tradenews", description="Força Trading News no canal de trading (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_tradenews(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    await postar_trading_news("manual")
+    await interaction.followup.send("✅ Trading News postadas no canal de trading.", ephemeral=True)
+
+@tree.command(name="traderesumo", description="Força Resumo de Trades no canal de trading (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_traderesumo(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    await postar_resumo_trading("manual")
+    await interaction.followup.send("✅ Resumo postado no canal de trading.", ephemeral=True)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -536,14 +667,16 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ─────────────────────────────
-# Scheduler 06/18
+# Scheduler 06/18 + Trading V2
 # ─────────────────────────────
 @tasks.loop(minutes=1)
 async def scheduler():
-    global ultima_manha, ultima_tarde
+    global ultima_manha, ultima_tarde, _ultima_trading_resumo, _ultima_trading_news
+
     agora = datetime.now(BR_TZ)
     hhmm = agora.strftime("%H:%M")
 
+    # Relatórios mercado
     if hhmm == "06:00" and ultima_manha != agora.date():
         await enviar_publicacoes("Abertura (06:00)", enviar_tg=True)
         ultima_manha = agora.date()
@@ -551,6 +684,22 @@ async def scheduler():
     if hhmm == "18:00" and ultima_tarde != agora.date():
         await enviar_publicacoes("Fechamento (18:00)", enviar_tg=True)
         ultima_tarde = agora.date()
+
+    # Trading News (multi-horários)
+    if getattr(config, "TRADING_NEWS_ATIVAS", True):
+        times = _parse_times_csv(getattr(config, "TRADING_NEWS_TIMES", "08:00,14:00,20:00"))
+        if hhmm in times:
+            last = _ultima_trading_news.get(hhmm)
+            if last != agora.date():
+                await postar_trading_news(hhmm)
+                _ultima_trading_news[hhmm] = agora.date()
+
+    # Resumo diário
+    if getattr(config, "TRADING_DAILY_SUMMARY_ATIVO", True):
+        alvo = getattr(config, "TRADING_DAILY_SUMMARY_TIME", "21:00")
+        if hhmm == alvo and _ultima_trading_resumo != agora.date():
+            await postar_resumo_trading(f"diário {alvo}")
+            _ultima_trading_resumo = agora.date()
 
 
 # ─────────────────────────────
@@ -563,7 +712,6 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    # ✅ garante cleanup interno do discord.py
     try:
         async with client:
             await client.start(TOKEN)
