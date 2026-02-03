@@ -1,18 +1,22 @@
 # main.py
 import os
 import asyncio
+import inspect
 import discord
 import pytz
 import aiohttp
 from datetime import datetime
 from discord.ext import tasks
 from discord import app_commands
-from typing import Optional
+from typing import Optional, Any
 
 import config
 import market
 import news
 import telegram
+
+from storage.sheets import SheetsStore
+from commands.trading import register_trading_commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
@@ -23,11 +27,15 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# ✅ Sheets + comandos de trading
+store = SheetsStore.from_env()
+register_trading_commands(tree, store, client)
+
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
 
-# Rompimento (funcionalidade continua ativa)
+# Rompimento
 ULTIMO_PRECO = {}      # {ativo: preco}
 FALHAS_SEGUIDAS = {}   # {ativo: count}
 
@@ -46,8 +54,24 @@ SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 # Sync do tree
 _TREE_SYNCED = False
 
-# ✅ Sync opcional (pra boot rápido)
-SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "0") == "1"
+
+# ─────────────────────────────
+# HELPERS: compat (sync/async)
+# ─────────────────────────────
+
+async def _maybe_await(x: Any):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+async def _call_sync_or_async(fn, *args, **kwargs):
+    """
+    Se fn for async: await.
+    Se fn for sync: roda em thread (não trava o bot).
+    """
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
 
 
 # ─────────────────────────────
@@ -147,7 +171,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
         return
 
     var = ((preco_atual - preco_antigo) / preco_antigo) * 100.0
-    if abs(var) < float(config.LIMITE_ROMPIMENTO_PCT):
+    if abs(var) < float(getattr(config, "LIMITE_ROMPIMENTO_PCT", 2.0)):
         return
 
     direcao = "🚨🔼 ROMPIMENTO DE ALTA" if var > 0 else "🚨🔽 ROMPIMENTO DE BAIXA"
@@ -170,10 +194,20 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 # COLETA CONCORRENTE
 # ─────────────────────────────
 
+async def _dados_ativo_async(ativo: str):
+    """
+    Compatível com:
+      - market.dados_ativo sync (requests)  -> roda em thread
+      - market.dados_ativo async (aiohttp)  -> await
+    """
+    if not hasattr(market, "dados_ativo"):
+        return None, None
+    return await _call_sync_or_async(market.dados_ativo, ativo)
+
 async def _fetch_one(categoria: str, ativo: str):
     async with SEM:
         try:
-            p, v = await market.dados_ativo(ativo)
+            p, v = await _dados_ativo_async(ativo)
 
             # FIIs: se preço não veio, não loga, só ignora
             if ativo.endswith("11.SA") and p is None:
@@ -197,6 +231,7 @@ async def _fetch_one(categoria: str, ativo: str):
 async def coletar_dados():
     coros = []
     order = []
+
     for categoria, ativos in config.ATIVOS.items():
         for ativo in ativos:
             coros.append(_fetch_one(categoria, ativo))
@@ -342,7 +377,9 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             return
 
         cot = await dolar_para_real_async()
-        manchetes = await news.noticias()
+
+        # news.noticias pode ser sync ou async
+        manchetes = await _maybe_await(news.noticias())
 
         canal_rel = client.get_channel(config.CANAL_ANALISE)
         canal_j = client.get_channel(config.CANAL_NOTICIAS)
@@ -352,13 +389,14 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
         else:
             await log_bot("CANAL_ANALISE inválido", "Não encontrei canal de análise.")
 
-        if canal_j and config.NEWS_ATIVAS:
+        if canal_j and getattr(config, "NEWS_ATIVAS", True):
             await canal_j.send(embed=embed_jornal(manchetes, periodo))
         else:
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg:
-            ok = await telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo))
+            # telegram.enviar_telegram pode ser sync ou async
+            ok = await _maybe_await(telegram.enviar_telegram(telegram_resumo(dados, manchetes, periodo)))
             if not ok:
                 await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
 
@@ -375,17 +413,24 @@ async def on_ready():
     global HTTP, _TREE_SYNCED
     print(f"🤖 Conectado como {client.user}")
 
+    # cria session HTTP (para FX e, se seus módulos suportarem, para providers)
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
         connector = aiohttp.TCPConnector(limit_per_host=MAX_CONCURRENCY, ttl_dns_cache=300)
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-        market.set_session(HTTP)
-        news.set_session(HTTP)
-        telegram.set_session(HTTP)
+        # chama set_session se existir (não quebra se seus módulos não tiverem)
+        for mod in (market, news, telegram):
+            if hasattr(mod, "set_session"):
+                try:
+                    mod.set_session(HTTP)
+                except Exception:
+                    pass
 
-    # ✅ Sync opcional: só quando você quiser (boot mais rápido)
-    if (not _TREE_SYNCED) and SYNC_COMMANDS:
+    # Sync controlado por env
+    do_sync = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
+
+    if do_sync and not _TREE_SYNCED:
         try:
             gid = os.getenv("GUILD_ID")
             if gid:
@@ -404,7 +449,7 @@ async def on_ready():
 
 
 # ─────────────────────────────
-# SLASH COMMANDS (somente 2)
+# SLASH COMMANDS (mantidos)
 # ─────────────────────────────
 
 @tree.command(
@@ -420,28 +465,15 @@ async def slash_testetudo(interaction: discord.Interaction):
 @tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_reiniciar(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Reiniciando AGORA...", ephemeral=True)
+    await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
+    await asyncio.sleep(2)
 
-    # Para scheduler antes de matar o processo
-    try:
-        scheduler.stop()
-    except Exception:
-        pass
-
-    # Fecha HTTP sem travar
     global HTTP
-    try:
-        if HTTP is not None:
-            await HTTP.close()
-            HTTP = None
-    except Exception:
-        pass
+    if HTTP is not None:
+        await HTTP.close()
+        HTTP = None
 
-    # Delay curto pra garantir que a resposta foi enviada
-    await asyncio.sleep(1.0)
-
-    # ⚡ FORÇA restart no Railway (exit code != 0)
-    os._exit(1)
+    await client.close()
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
