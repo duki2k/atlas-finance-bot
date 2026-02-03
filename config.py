@@ -34,3 +34,8 @@ ATIVOS = {
         "DIA", "IWM", "EFA", "VEA", "VNQ",
     ],
 }
+
+# Trading V2
+TRADING_ENABLED = True
+TRADING_CHANNEL_ID = int(os.getenv("TRADING_CHANNEL_ID", "0") or "0")
+TRADING_CHANNEL_ONLY = True
