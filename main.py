@@ -31,6 +31,9 @@ SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
 GUILD_ID = os.getenv("GUILD_ID", "").strip()
 
+# (Opcional) controla se loga SIGTERM/SIGINT no canal de logs
+LOG_SIGTERM = os.getenv("LOG_SIGTERM", "0").strip() == "1"
+
 # Estado
 PUBLICACAO_LOCK = asyncio.Lock()
 ultima_manha = None
@@ -110,6 +113,10 @@ async def log_bot(titulo: str, mensagem: str):
     await canal.send(embed=embed)
 
 def _admin_channel_ok(interaction: discord.Interaction) -> bool:
+    """
+    Se config.CANAL_ADMIN existir, restringe comandos ao canal admin.
+    Se não existir, libera geral.
+    """
     canal_admin = getattr(config, "CANAL_ADMIN", 0)
     if canal_admin and interaction.channel_id != int(canal_admin):
         return False
@@ -180,7 +187,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
 
 # ─────────────────────────────
-# Coleta concorrente (market.py é async no teu ZIP)
+# Coleta concorrente (market.py do seu repo é async e usa session via set_session)
 # ─────────────────────────────
 async def _fetch_one(categoria: str, ativo: str):
     async with SEM:
@@ -464,8 +471,10 @@ async def shutdown(reason: str = "shutdown"):
         if scheduler.is_running():
             scheduler.cancel()
 
-    with contextlib.suppress(Exception):
-        await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
+    # ✅ Evita spam de SIGTERM/SIGINT em redeploy/restart do Railway
+    if LOG_SIGTERM or reason not in ("SIGTERM", "SIGINT"):
+        with contextlib.suppress(Exception):
+            await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
     with contextlib.suppress(Exception):
         await _close_http()
@@ -498,7 +507,7 @@ async def on_ready():
     global HTTP, _TREE_SYNCED
     print(f"🤖 Conectado como {client.user}")
 
-    # cria UMA sessão e injeta nos módulos (isso é o que estava faltando)
+    # cria UMA sessão e injeta nos módulos
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
         connector = aiohttp.TCPConnector(
@@ -508,7 +517,7 @@ async def on_ready():
         )
         HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-        # ✅ essencial para teu market/news/telegram do ZIP
+        # ✅ essencial para seu repo
         market.set_session(HTTP)
         news.set_session(HTTP)
         telegram.set_session(HTTP)
@@ -536,6 +545,7 @@ async def on_ready():
 async def main():
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN não definido.")
+
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
