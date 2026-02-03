@@ -35,7 +35,18 @@ ATIVOS = {
     ],
 }
 
+import os
+
 # Trading V2
 TRADING_ENABLED = True
 TRADING_CHANNEL_ID = int(os.getenv("TRADING_CHANNEL_ID", "0") or "0")
 TRADING_CHANNEL_ONLY = True
+
+# Trading News (RSS)
+TRADING_NEWS_ATIVAS = os.getenv("TRADING_NEWS_ATIVAS", "1") == "1"
+TRADING_NEWS_TIMES = os.getenv("TRADING_NEWS_TIMES", "08:00,14:00,20:00")  # horários separados por vírgula
+
+# Resumo diário de trades
+TRADING_DAILY_SUMMARY_ATIVO = os.getenv("TRADING_DAILY_SUMMARY_ATIVO", "1") == "1"
+TRADING_DAILY_SUMMARY_TIME = os.getenv("TRADING_DAILY_SUMMARY_TIME", "21:00")  # HH:MM
+
