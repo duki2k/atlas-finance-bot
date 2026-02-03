@@ -46,6 +46,9 @@ SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 # Sync do tree
 _TREE_SYNCED = False
 
+# ✅ Sync opcional (pra boot rápido)
+SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "0") == "1"
+
 
 # ─────────────────────────────
 # UTIL
@@ -381,7 +384,8 @@ async def on_ready():
         news.set_session(HTTP)
         telegram.set_session(HTTP)
 
-    if not _TREE_SYNCED:
+    # ✅ Sync opcional: só quando você quiser (boot mais rápido)
+    if (not _TREE_SYNCED) and SYNC_COMMANDS:
         try:
             gid = os.getenv("GUILD_ID")
             if gid:
@@ -416,15 +420,28 @@ async def slash_testetudo(interaction: discord.Interaction):
 @tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_reiniciar(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
-    await asyncio.sleep(2)
+    await interaction.response.send_message("🔄 Reiniciando AGORA...", ephemeral=True)
 
+    # Para scheduler antes de matar o processo
+    try:
+        scheduler.stop()
+    except Exception:
+        pass
+
+    # Fecha HTTP sem travar
     global HTTP
-    if HTTP is not None:
-        await HTTP.close()
-        HTTP = None
+    try:
+        if HTTP is not None:
+            await HTTP.close()
+            HTTP = None
+    except Exception:
+        pass
 
-    await client.close()
+    # Delay curto pra garantir que a resposta foi enviada
+    await asyncio.sleep(1.0)
+
+    # ⚡ FORÇA restart no Railway (exit code != 0)
+    os._exit(1)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
