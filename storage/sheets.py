@@ -55,4 +55,78 @@ class SheetsStore:
 
         return await self._to_thread(_run)
 
-    as
+    async def append_trade(self, row: List[Any]) -> bool:
+        """Append uma linha na aba trades."""
+        def _run():
+            body = {"values": [row]}
+            self._svc.spreadsheets().values().append(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.tab_trades}!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            ).execute()
+            return True
+
+        try:
+            return await self._to_thread(_run)
+        except Exception:
+            return False
+
+    async def get_all_trades(self) -> List[List[str]]:
+        """Lê todas as linhas da aba trades."""
+        def _run():
+            resp = self._svc.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.tab_trades}!A:Z"
+            ).execute()
+            return resp.get("values", [])
+
+        return await self._to_thread(_run)
+
+    async def find_trade_row(self, trade_id: str) -> Tuple[Optional[int], Optional[List[str]], Optional[List[str]]]:
+        """
+        Retorna: (row_index_1based, header, row)
+        row_index_1based: número da linha na planilha (1 = header)
+        """
+        values = await self.get_all_trades()
+        if not values or len(values) < 2:
+            return None, None, None
+
+        header = values[0]
+        for idx, row in enumerate(values[1:], start=2):
+            if len(row) > 0 and row[0] == trade_id:
+                return idx, header, row
+        return None, header, None
+
+    async def update_trade_by_id(self, trade_id: str, updates: Dict[str, Any]) -> bool:
+        """
+        Atualiza colunas específicas na linha do trade.
+        updates: {col_name: value}
+        """
+        row_idx, header, row = await self.find_trade_row(trade_id)
+        if not row_idx or not header:
+            return False
+
+        row = row or []
+        row = row + [""] * (len(header) - len(row))
+
+        col_map = {name: i for i, name in enumerate(header)}
+        for k, v in updates.items():
+            if k in col_map:
+                row[col_map[k]] = "" if v is None else str(v)
+
+        def _run():
+            body = {"values": [row]}
+            self._svc.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.tab_trades}!A{row_idx}:Z{row_idx}",
+                valueInputOption="USER_ENTERED",
+                body=body
+            ).execute()
+            return True
+
+        try:
+            return await self._to_thread(_run)
+        except Exception:
+            return False
