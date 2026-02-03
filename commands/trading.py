@@ -1,337 +1,282 @@
-# commands/trading.py
 import os
 import uuid
 import discord
 from datetime import datetime
 from discord import app_commands
-import pytz
+from typing import Optional
 
-BR_TZ = pytz.timezone("America/Sao_Paulo")
-
-
-def _mention_channel(ch_id: int) -> str:
-    return f"<#{ch_id}>"
+import config
 
 
-def _calc_r_multiple(side: str, entry: float, stop: float, exit_price: float):
-    risk = abs(entry - stop)
-    if risk <= 0:
+def _now_br():
+    # datetime naive ok, só para texto
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
+
+
+def _parse_float(s: str) -> Optional[float]:
+    try:
+        return float(str(s).replace(",", "."))
+    except Exception:
         return None
 
-    side = (side or "").upper()
-    if side == "SHORT":
-        return (entry - exit_price) / risk
-    return (exit_price - entry) / risk  # LONG default
+
+def _calc_r(side: str, entry: float, stop: float, exit_price: float) -> Optional[float]:
+    """
+    R = (resultado) / (risco)
+    LONG: (exit-entry)/(entry-stop)
+    SHORT: (entry-exit)/(stop-entry)
+    """
+    if entry is None or stop is None or exit_price is None:
+        return None
+
+    risk_long = entry - stop
+    risk_short = stop - entry
+    if side == "LONG":
+        if risk_long == 0:
+            return None
+        return (exit_price - entry) / risk_long
+    else:
+        if risk_short == 0:
+            return None
+        return (entry - exit_price) / risk_short
+
+
+def _require_trading_channel(interaction: discord.Interaction) -> bool:
+    only = getattr(config, "TRADING_CHANNEL_ONLY", True)
+    chan_id = getattr(config, "TRADING_CHANNEL_ID", 0)
+    if not only or not chan_id:
+        return True
+    return interaction.channel_id == int(chan_id)
 
 
 def register_trading_commands(tree: app_commands.CommandTree, store, client: discord.Client):
-    """
-    Registra comandos de trading:
-      - /nova_entrada
-      - /fechar_trade
-      - /stats
-    store: SheetsStore ou None
-    """
+    enabled = getattr(config, "TRADING_ENABLED", True)
 
-    async def _ensure_store(interaction: discord.Interaction) -> bool:
-        if store is None:
-            await interaction.response.send_message(
-                "❌ Sheets não configurado. Falta `GOOGLE_SHEET_ID` e/ou `GOOGLE_SA_B64` no Railway.",
-                ephemeral=True
-            )
-            return False
-        return True
+    if not enabled:
+        return
 
-    def _get_trading_channel_id() -> int:
-        v = os.getenv("CANAL_TRADING")
-        return int(v) if v else 0
-
-    @tree.command(name="nova_entrada", description="Cria uma entrada no canal de trading e registra no Sheets (Admin)")
+    @tree.command(name="tradeabrir", description="Registra um trade (paper/educacional) (Admin)")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
-        asset="Ex: BTC-USD, AAPL, PETR4.SA",
+        asset="Ex: BTCUSDT, AAPL, PETR4.SA",
         side="LONG ou SHORT",
-        timeframe="Ex: 15m, 1h, 4h, 1d",
-        entry="Preço de entrada (ou zona central)",
-        stop="Stop (invalidação)",
+        timeframe="Ex: 5m, 15m, 1h, 4h, 1d",
+        entry="Preço de entrada",
+        stop="Stop",
         tp1="Alvo 1 (opcional)",
         tp2="Alvo 2 (opcional)",
-        notes="Motivo/observação (opcional)"
+        notes="Observações (opcional)",
     )
-    async def nova_entrada(
+    async def tradeabrir(
         interaction: discord.Interaction,
         asset: str,
         side: str,
         timeframe: str,
-        entry: float,
-        stop: float,
-        tp1: float = 0.0,
-        tp2: float = 0.0,
-        notes: str = ""
+        entry: str,
+        stop: str,
+        tp1: Optional[str] = None,
+        tp2: Optional[str] = None,
+        notes: Optional[str] = None,
     ):
-        if not await _ensure_store(interaction):
+        if not _require_trading_channel(interaction):
+            await interaction.response.send_message("⚠️ Use este comando apenas no canal de trading.", ephemeral=True)
             return
 
-        trading_channel_id = _get_trading_channel_id()
-        if trading_channel_id <= 0:
-            await interaction.response.send_message(
-                "❌ `CANAL_TRADING` não configurado no Railway.",
-                ephemeral=True
-            )
+        side = side.upper().strip()
+        if side not in ("LONG", "SHORT"):
+            await interaction.response.send_message("❌ side deve ser LONG ou SHORT.", ephemeral=True)
             return
 
-        await store.ensure_tab()
+        f_entry = _parse_float(entry)
+        f_stop = _parse_float(stop)
+        f_tp1 = _parse_float(tp1) if tp1 else None
+        f_tp2 = _parse_float(tp2) if tp2 else None
 
-        trade_id = f"ATL-{uuid.uuid4().hex[:8].upper()}"
-        now = datetime.now(BR_TZ)
-
-        ch = client.get_channel(trading_channel_id)
-        if ch is None:
-            await interaction.response.send_message(
-                f"❌ Não encontrei o canal {trading_channel_id}.",
-                ephemeral=True
-            )
+        if f_entry is None or f_stop is None:
+            await interaction.response.send_message("❌ entry e stop precisam ser números válidos.", ephemeral=True)
             return
 
-        side_u = (side or "").upper()
-        color = 0x2ECC71 if side_u == "LONG" else 0xE74C3C
+        trade_id = uuid.uuid4().hex[:8].upper()
 
         embed = discord.Embed(
-            title=f"🧠 Nova Entrada — {asset} ({side_u})",
-            description=f"🆔 `{trade_id}`\n⏱️ **TF:** {timeframe}\n📍 **Status:** OPEN",
-            color=color
+            title="📌 Trade Registrado (Paper/Educacional)",
+            description=f"🆔 **ID:** `{trade_id}`\n⏱️ **Horário:** {_now_br()}",
+            color=0x5865F2
         )
-        embed.add_field(name="Entrada", value=f"{entry:,.6f}", inline=True)
-        embed.add_field(name="Stop", value=f"{stop:,.6f}", inline=True)
-
-        if tp1 and tp1 > 0:
-            embed.add_field(name="TP1", value=f"{tp1:,.6f}", inline=True)
-        if tp2 and tp2 > 0:
-            embed.add_field(name="TP2", value=f"{tp2:,.6f}", inline=True)
-
-        if notes.strip():
+        embed.add_field(name="Ativo", value=f"`{asset.upper()}`", inline=True)
+        embed.add_field(name="Lado", value=f"**{side}**", inline=True)
+        embed.add_field(name="Timeframe", value=f"`{timeframe}`", inline=True)
+        embed.add_field(name="Entrada", value=f"{f_entry}", inline=True)
+        embed.add_field(name="Stop", value=f"{f_stop}", inline=True)
+        embed.add_field(name="TP1", value=f"{f_tp1}" if f_tp1 is not None else "—", inline=True)
+        embed.add_field(name="TP2", value=f"{f_tp2}" if f_tp2 is not None else "—", inline=True)
+        if notes:
             embed.add_field(name="Notas", value=notes[:900], inline=False)
 
-        embed.set_footer(text=now.strftime("%d/%m/%Y %H:%M (BR)"))
-        msg = await ch.send(embed=embed)
+        embed.set_footer(text="⚠️ Conteúdo educacional/paper. Não é recomendação de investimento.")
 
-        row = [
-            trade_id,
-            now.isoformat(),
-            str(interaction.user.id),
-            str(trading_channel_id),
-            str(msg.id),
-            asset,
-            side_u,
-            timeframe,
-            entry,
-            stop,
-            tp1 if tp1 and tp1 > 0 else "",
-            tp2 if tp2 and tp2 > 0 else "",
-            "OPEN",
-            "",
-            "",
-            "",
-            "",
-            "",
-            notes or ""
-        ]
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
-        ok = await store.append_trade(row)
-        if not ok:
-            await interaction.response.send_message("⚠️ Entrada criada, mas falhou ao salvar no Sheets.", ephemeral=True)
+        chan_id = int(getattr(config, "TRADING_CHANNEL_ID", interaction.channel_id))
+        channel = client.get_channel(chan_id) or interaction.channel
+
+        msg = await channel.send(embed=embed)
+
+        row = {
+            "trade_id": trade_id,
+            "created_at": _now_br(),
+            "created_by": str(interaction.user.id),
+            "channel_id": str(channel.id),
+            "message_id": str(msg.id),
+            "asset": asset.upper(),
+            "side": side,
+            "timeframe": timeframe,
+            "entry": f_entry,
+            "stop": f_stop,
+            "tp1": f_tp1 if f_tp1 is not None else "",
+            "tp2": f_tp2 if f_tp2 is not None else "",
+            "status": "OPEN",
+            "notes": notes or "",
+        }
+
+        ok = await store.append_trade(row) if hasattr(store, "append_trade") else False
+        if not ok and getattr(store, "enabled", lambda: False)():
+            await interaction.followup.send("⚠️ Trade registrado no Discord, mas falhou ao salvar no Sheets.", ephemeral=True)
             return
 
-        await interaction.response.send_message(
-            f"✅ Entrada criada em {_mention_channel(trading_channel_id)} com ID `{trade_id}`.",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"✅ Trade registrado com ID `{trade_id}`.", ephemeral=True)
 
-    @tree.command(name="fechar_trade", description="Fecha uma entrada (GREEN/RED/BE) e registra no Sheets (Admin)")
+    @tree.command(name="tradefechar", description="Fecha um trade e marca GREEN/RED/BE (Admin)")
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
-        trade_id="ID do trade (ATL-XXXXXXXX)",
-        outcome="GREEN ou RED ou BE",
-        exit_price="Preço de saída (opcional, para calcular R)",
-        notes="Observação final (opcional)"
+        trade_id="ID do trade",
+        outcome="GREEN / RED / BE",
+        exit_price="Preço de saída",
+        notes="Notas finais (opcional)",
     )
-    async def fechar_trade(
+    async def tradefechar(
         interaction: discord.Interaction,
         trade_id: str,
         outcome: str,
-        exit_price: float = 0.0,
-        notes: str = ""
+        exit_price: str,
+        notes: Optional[str] = None,
     ):
-        if not await _ensure_store(interaction):
+        if not _require_trading_channel(interaction):
+            await interaction.response.send_message("⚠️ Use este comando apenas no canal de trading.", ephemeral=True)
             return
 
-        outcome_u = (outcome or "").upper()
-        if outcome_u not in ("GREEN", "RED", "BE"):
-            await interaction.response.send_message("❌ outcome precisa ser GREEN, RED ou BE.", ephemeral=True)
+        outcome = outcome.upper().strip()
+        if outcome not in ("GREEN", "RED", "BE"):
+            await interaction.response.send_message("❌ outcome deve ser GREEN, RED ou BE.", ephemeral=True)
             return
 
-        row_idx, header, row = await store.find_trade_row(trade_id)
-        if not row_idx:
-            await interaction.response.send_message("❌ Trade não encontrado no Sheets.", ephemeral=True)
+        f_exit = _parse_float(exit_price)
+        if f_exit is None:
+            await interaction.response.send_message("❌ exit_price precisa ser número válido.", ephemeral=True)
             return
 
-        row = row + [""] * (len(header) - len(row))
-        col = {name: i for i, name in enumerate(header)}
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
-        status = (row[col.get("status", 12)] or "").upper()
-        if status == "CLOSED":
-            await interaction.response.send_message("⚠️ Esse trade já está fechado.", ephemeral=True)
-            return
+        # Para calcular R, vamos tentar pegar o trade OPEN mais recente (se store suportar listagem)
+        side = None
+        entry = None
+        stop = None
 
-        asset = row[col.get("asset", 5)]
-        side = row[col.get("side", 6)]
-        timeframe = row[col.get("timeframe", 7)]
+        if hasattr(store, "list_trades"):
+            opens = await store.list_trades(status="OPEN", limit=200)
+            for t in opens:
+                if str(t.get("trade_id", "")).upper() == trade_id.upper():
+                    side = str(t.get("side", "")).upper()
+                    entry = _parse_float(t.get("entry", ""))
+                    stop = _parse_float(t.get("stop", ""))
+                    break
 
-        entry = float(row[col.get("entry", 8)] or 0)
-        stop = float(row[col.get("stop", 9)] or 0)
+        r_val = _calc_r(side or "LONG", entry, stop, f_exit) if entry is not None and stop is not None else None
+        r_str = f"{r_val:.3f}" if r_val is not None else ""
 
-        r_mult = None
-        exit_val = None
-        if exit_price and exit_price > 0:
-            exit_val = float(exit_price)
-            r_mult = _calc_r_multiple(side, entry, stop, exit_val)
+        ok = await store.close_trade(
+            trade_id=trade_id.upper(),
+            closed_at=_now_br(),
+            closed_by=str(interaction.user.id),
+            outcome=outcome,
+            exit_price=str(f_exit),
+            r_multiple=r_str,
+            notes=(notes or ""),
+        ) if hasattr(store, "close_trade") else False
 
-        now = datetime.now(BR_TZ)
-
-        existing_notes = row[col.get("notes", 18)] if "notes" in col else ""
-        final_notes = notes.strip() if notes.strip() else (existing_notes or "")
-
-        updates = {
-            "status": "CLOSED",
-            "closed_at": now.isoformat(),
-            "closed_by": str(interaction.user.id),
-            "outcome": outcome_u,
-            "exit_price": (exit_val if exit_val is not None else ""),
-            "r_multiple": (round(r_mult, 2) if r_mult is not None else ""),
-            "notes": final_notes
-        }
-
-        ok = await store.update_trade_by_id(trade_id, updates)
         if not ok:
-            await interaction.response.send_message("❌ Falha ao atualizar o Sheets.", ephemeral=True)
+            await interaction.followup.send("❌ Não consegui fechar no Sheets. Confere se o ID existe e está OPEN.", ephemeral=True)
             return
 
-        # postar resultado no canal
-        try:
-            trading_channel_id = int(row[col.get("channel_id", 3)] or 0)
-            message_id = int(row[col.get("message_id", 4)] or 0)
-        except Exception:
-            trading_channel_id, message_id = 0, 0
+        await interaction.followup.send(f"✅ Trade `{trade_id.upper()}` fechado como **{outcome}**. R={r_str or '—'}", ephemeral=True)
 
-        ch = client.get_channel(trading_channel_id) if trading_channel_id else None
-
-        color = 0x2ECC71 if outcome_u == "GREEN" else (0xE74C3C if outcome_u == "RED" else 0xF1C40F)
-        icon = "✅" if outcome_u == "GREEN" else ("🛑" if outcome_u == "RED" else "⚖️")
-
-        emb = discord.Embed(
-            title=f"{icon} Fechamento — {asset} ({side})",
-            description=f"🆔 `{trade_id}`\n⏱️ **TF:** {timeframe}\n📍 **Status:** CLOSED",
-            color=color
-        )
-        emb.add_field(name="Outcome", value=outcome_u, inline=True)
-        if exit_val is not None:
-            emb.add_field(name="Saída", value=f"{exit_val:,.6f}", inline=True)
-        if r_mult is not None:
-            emb.add_field(name="Resultado (R)", value=f"{r_mult:+.2f}R", inline=True)
-        if final_notes:
-            emb.add_field(name="Notas", value=final_notes[:900], inline=False)
-        emb.set_footer(text=now.strftime("%d/%m/%Y %H:%M (BR)"))
-
-        if ch:
-            await ch.send(embed=emb)
-
-            # tenta editar msg original (não é obrigatório)
-            if message_id:
-                try:
-                    msg = await ch.fetch_message(message_id)
-                    if msg.embeds:
-                        e0 = msg.embeds[0]
-                        e0_new = discord.Embed.from_dict(e0.to_dict())
-                        e0_new.description = (e0_new.description or "") + f"\n\n✅ **Fechado:** {outcome_u}"
-                        await msg.edit(embed=e0_new)
-                except Exception:
-                    pass
-
-        await interaction.response.send_message("✅ Trade fechado e registrado.", ephemeral=True)
-
-    @tree.command(name="stats", description="Resumo de performance baseado no Sheets (Admin)")
+    @tree.command(name="trades", description="Lista trades OPEN (Admin)")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(days="Período em dias (ex: 7, 30, 90)")
-    async def stats(interaction: discord.Interaction, days: int = 30):
-        if not await _ensure_store(interaction):
+    async def trades(interaction: discord.Interaction):
+        if not _require_trading_channel(interaction):
+            await interaction.response.send_message("⚠️ Use este comando apenas no canal de trading.", ephemeral=True)
             return
 
-        values = await store.get_all_trades()
-        if not values or len(values) < 2:
-            await interaction.response.send_message("⚠️ Sem trades registrados ainda.", ephemeral=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        if not hasattr(store, "list_trades"):
+            await interaction.followup.send("❌ Storage não suporta listagem.", ephemeral=True)
             return
 
-        header = values[0]
-        col = {name: i for i, name in enumerate(header)}
-
-        now = datetime.now(BR_TZ)
-        cutoff = now.timestamp() - (days * 86400)
-
-        total = 0
-        wins = 0
-        losses = 0
-        be = 0
-        r_sum = 0.0
-        r_count = 0
-
-        for row in values[1:]:
-            row = row + [""] * (len(header) - len(row))
-            status = (row[col.get("status", 12)] or "").upper()
-            if status != "CLOSED":
-                continue
-
-            closed_at = row[col.get("closed_at", 13)] or ""
-            try:
-                ts = datetime.fromisoformat(closed_at).timestamp()
-            except Exception:
-                ts = None
-
-            if ts is not None and ts < cutoff:
-                continue
-
-            outcome = (row[col.get("outcome", 15)] or "").upper()
-            total += 1
-            if outcome == "GREEN":
-                wins += 1
-            elif outcome == "RED":
-                losses += 1
-            else:
-                be += 1
-
-            r = row[col.get("r_multiple", 17)] or ""
-            try:
-                r_val = float(r)
-                r_sum += r_val
-                r_count += 1
-            except Exception:
-                pass
-
-        if total == 0:
-            await interaction.response.send_message(f"⚠️ Sem trades fechados nos últimos {days} dias.", ephemeral=True)
+        items = await store.list_trades(status="OPEN", limit=15)
+        if not items:
+            await interaction.followup.send("📭 Nenhum trade OPEN no momento.", ephemeral=True)
             return
 
-        winrate = (wins / total) * 100.0
-        avg_r = (r_sum / r_count) if r_count else None
+        embed = discord.Embed(title="📋 Trades OPEN", color=0x00BFFF)
+        for t in items[:15]:
+            embed.add_field(
+                name=f"🆔 {t.get('trade_id','')}",
+                value=(
+                    f"**{t.get('asset','')}** | {t.get('side','')} | {t.get('timeframe','')}\n"
+                    f"Entrada: {t.get('entry','')} | Stop: {t.get('stop','')}"
+                ),
+                inline=False
+            )
 
-        msg = (
-            f"📈 **Stats ({days}d)**\n"
-            f"• Trades fechados: **{total}**\n"
-            f"• GREEN: **{wins}** | RED: **{losses}** | BE: **{be}**\n"
-            f"• Winrate: **{winrate:.1f}%**\n"
-        )
-        if avg_r is not None:
-            msg += f"• Avg R (onde informado): **{avg_r:+.2f}R**\n"
-        else:
-            msg += "• Avg R: **—** (informe `exit_price` ao fechar)\n"
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
-        await interaction.response.send_message(msg, ephemeral=True)
+    @tree.command(name="tradestats", description="Estatísticas rápidas (Admin)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def tradestats(interaction: discord.Interaction):
+        if not _require_trading_channel(interaction):
+            await interaction.response.send_message("⚠️ Use este comando apenas no canal de trading.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        if not hasattr(store, "list_trades"):
+            await interaction.followup.send("❌ Storage não suporta estatística.", ephemeral=True)
+            return
+
+        closed = await store.list_trades(status="CLOSED", limit=200)
+        open_ = await store.list_trades(status="OPEN", limit=200)
+
+        total = len(closed)
+        greens = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "GREEN")
+        reds = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "RED")
+        bes = sum(1 for t in closed if str(t.get("outcome", "")).upper() == "BE")
+
+        rs = []
+        for t in closed:
+            r = _parse_float(t.get("r_multiple", ""))
+            if r is not None:
+                rs.append(r)
+
+        winrate = (greens / total * 100.0) if total else 0.0
+        avg_r = (sum(rs) / len(rs)) if rs else 0.0
+
+        embed = discord.Embed(title="📈 Trading Stats (rápido)", color=0x2ECC71 if winrate >= 50 else 0xE74C3C)
+        embed.add_field(name="OPEN", value=str(len(open_)), inline=True)
+        embed.add_field(name="CLOSED", value=str(total), inline=True)
+        embed.add_field(name="Winrate", value=f"{winrate:.1f}%", inline=True)
+        embed.add_field(name="GREEN / RED / BE", value=f"{greens} / {reds} / {bes}", inline=False)
+        embed.add_field(name="Média de R", value=f"{avg_r:.3f}" if rs else "—", inline=True)
+        embed.set_footer(text="⚠️ Paper/educacional. Use gestão de risco.")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
