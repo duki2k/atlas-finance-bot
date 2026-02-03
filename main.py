@@ -5,7 +5,7 @@ import discord
 import pytz
 import aiohttp
 from datetime import datetime
-from discord.ext import commands, tasks
+from discord.ext import tasks
 from discord import app_commands
 from typing import Optional
 
@@ -17,9 +17,11 @@ import telegram
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-# Slash-only: não precisa message_content
+# Slash-only: sem message_content
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
@@ -94,7 +96,7 @@ def ideias_em_baixa() -> str:
     )
 
 async def log_bot(titulo: str, mensagem: str):
-    canal = bot.get_channel(config.CANAL_LOGS)
+    canal = client.get_channel(config.CANAL_LOGS)
     if not canal:
         return
     embed = discord.Embed(title=f"📋 {titulo}", description=mensagem, color=0xE67E22)
@@ -127,11 +129,11 @@ async def dolar_para_real_async() -> float:
 
 
 # ─────────────────────────────
-# ALERTA AUTOMÁTICO (ROMPIMENTO) — continua ativo
+# ALERTA AUTOMÁTICO (ROMPIMENTO)
 # ─────────────────────────────
 
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
-    canal = bot.get_channel(config.CANAL_NOTICIAS)
+    canal = client.get_channel(config.CANAL_NOTICIAS)
     if not canal:
         return
 
@@ -339,8 +341,8 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
         cot = await dolar_para_real_async()
         manchetes = await news.noticias()
 
-        canal_rel = bot.get_channel(config.CANAL_ANALISE)
-        canal_j = bot.get_channel(config.CANAL_NOTICIAS)
+        canal_rel = client.get_channel(config.CANAL_ANALISE)
+        canal_j = client.get_channel(config.CANAL_NOTICIAS)
 
         if canal_rel:
             await canal_rel.send(embed=embed_relatorio(dados, cot))
@@ -365,10 +367,10 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
 # READY + SYNC SLASH COMMANDS
 # ─────────────────────────────
 
-@bot.event
+@client.event
 async def on_ready():
     global HTTP, _TREE_SYNCED
-    print(f"🤖 Conectado como {bot.user}")
+    print(f"🤖 Conectado como {client.user}")
 
     if HTTP is None:
         timeout = aiohttp.ClientTimeout(total=12, connect=3, sock_read=8)
@@ -379,17 +381,15 @@ async def on_ready():
         news.set_session(HTTP)
         telegram.set_session(HTTP)
 
-    # Sync: remove comandos antigos e mantém só os atuais
     if not _TREE_SYNCED:
         try:
-            gid = os.getenv("GUILD_ID")  # recomendado
+            gid = os.getenv("GUILD_ID")
             if gid:
                 guild = discord.Object(id=int(gid))
-                bot.tree.copy_global_to(guild=guild)
-                await bot.tree.sync(guild=guild)
+                await tree.sync(guild=guild)
                 print(f"✅ Slash commands sincronizados no servidor {gid}")
             else:
-                await bot.tree.sync()
+                await tree.sync()
                 print("✅ Slash commands sincronizados globalmente")
             _TREE_SYNCED = True
         except Exception as e:
@@ -403,7 +403,7 @@ async def on_ready():
 # SLASH COMMANDS (somente 2)
 # ─────────────────────────────
 
-@bot.tree.command(
+@tree.command(
     name="testetudo",
     description="Testa todas as publicações oficiais (Relatório + Jornal + Telegram) (Admin)"
 )
@@ -413,7 +413,7 @@ async def slash_testetudo(interaction: discord.Interaction):
     await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
     await interaction.followup.send("✅ Disparei todas as publicações oficiais (Discord + Telegram).", ephemeral=True)
 
-@bot.tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
+@tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_reiniciar(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Reiniciando bot...", ephemeral=True)
@@ -424,9 +424,9 @@ async def slash_reiniciar(interaction: discord.Interaction):
         await HTTP.close()
         HTTP = None
 
-    await bot.close()
+    await client.close()
 
-@bot.tree.error
+@tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ Você não tem permissão para usar este comando."
@@ -457,4 +457,4 @@ async def scheduler():
         ultima_tarde = agora.date()
 
 
-bot.run(TOKEN)
+client.run(TOKEN)
