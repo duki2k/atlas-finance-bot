@@ -30,6 +30,12 @@ def set_session(session: aiohttp.ClientSession):
     global _SESSION
     _SESSION = session
 
+def _get_session() -> aiohttp.ClientSession:
+    """Retorna a sessão configurada (e aberta) ou lança erro claro."""
+    if _SESSION is None or _SESSION.closed:
+        raise RuntimeError("market.py: session não foi configurada. Chame market.set_session() no main.py")
+    return _SESSION
+
 def eh_fii(ativo: str) -> bool:
     return ativo.endswith("11.SA")
 
@@ -72,14 +78,13 @@ async def _http_get_json(url, *, params=None, headers=None, timeout=12, retries=
     """
     GET assíncrono com retry + backoff curto.
     """
-    if _SESSION is None:
-        raise RuntimeError("market.py: session não foi configurada. Chame market.set_session() no main.py")
+    session = _get_session()
 
     headers = headers or HEADERS
 
     for i in range(retries + 1):
         try:
-            async with _SESSION.get(url, params=params, headers=headers, timeout=timeout) as r:
+            async with session.get(url, params=params, headers=headers, timeout=timeout) as r:
                 r.raise_for_status()
                 return await r.json()
         except Exception:
