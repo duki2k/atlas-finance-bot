@@ -23,13 +23,18 @@ def set_session(session: aiohttp.ClientSession):
     _SESSION = session
 
 
-async def _fetch_text(url: str, timeout: int = 10, retries: int = 1) -> str:
-    if _SESSION is None:
+def _get_session() -> aiohttp.ClientSession:
+    if _SESSION is None or _SESSION.closed:
         raise RuntimeError("news.py: session não foi configurada. Chame news.set_session() no main.py")
+    return _SESSION
+
+
+async def _fetch_text(url: str, timeout: int = 10, retries: int = 1) -> str:
+    session = _get_session()
 
     for i in range(retries + 1):
         try:
-            async with _SESSION.get(url, timeout=timeout) as r:
+            async with session.get(url, timeout=timeout) as r:
                 r.raise_for_status()
                 return await r.text()
         except Exception:
