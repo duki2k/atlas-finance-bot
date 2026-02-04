@@ -34,6 +34,9 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# ✅ Canal único permitido para comandos
+ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
+
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
@@ -54,6 +57,26 @@ _SHUTTING_DOWN = False
 
 # Sessão HTTP compartilhada (CoinGecko/Yahoo/Telegram etc.)
 HTTP_SESSION: aiohttp.ClientSession | None = None
+
+
+# ─────────────────────────────
+# CHECK GLOBAL: comandos só no canal admin
+# ─────────────────────────────
+@tree.check
+async def enforce_admin_channel(interaction: discord.Interaction) -> bool:
+    # Se não configurou CANAL_ADMIN, não trava tudo sem querer
+    if ADMIN_CHANNEL_ID <= 0:
+        return True
+
+    # Bloqueia DM
+    if interaction.guild is None:
+        raise app_commands.CheckFailure("Comandos disponíveis apenas no servidor.")
+
+    # Trava por canal
+    if interaction.channel_id != ADMIN_CHANNEL_ID:
+        raise app_commands.CheckFailure(f"Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
+
+    return True
 
 
 # ─────────────────────────────
@@ -340,7 +363,6 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg and hasattr(telegram, "enviar_telegram"):
-            # compatível com sync OU async
             ok = await _maybe_await(telegram.enviar_telegram(f"📌 Atlas Finance — {periodo}"))
             if ok is False:
                 await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
@@ -353,7 +375,6 @@ async def _run_signals_now():
     if signals is None:
         return False, "signals.py não está disponível."
 
-    # tenta achar uma função padrão no seu signals.py
     for fname in ("run_now", "sinais_agora", "enviar_agora", "publicar_agora", "scan_and_post", "scan_signals"):
         fn = getattr(signals, fname, None)
         if callable(fn):
@@ -394,7 +415,7 @@ async def slash_sinaisstatus(interaction: discord.Interaction):
 @tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_testetudo(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
     await interaction.followup.send("✅ Disparei as publicações.", ephemeral=True)
 
@@ -408,6 +429,15 @@ async def slash_reiniciar(interaction: discord.Interaction):
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # ✅ Bloqueio por canal
+    if isinstance(error, app_commands.CheckFailure):
+        msg = str(error) or f"Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>."
+        if interaction.response.is_done():
+            await interaction.followup.send(f"⛔ {msg}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⛔ {msg}", ephemeral=True)
+        return
+
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ Você não tem permissão para usar este comando."
         if interaction.response.is_done():
@@ -415,7 +445,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         else:
             await interaction.response.send_message(msg, ephemeral=True)
         return
-    await log_bot("Erro em slash command", str(error))
+
+    with contextlib.suppress(Exception):
+        await log_bot("Erro em slash command", str(error))
 
 
 # ─────────────────────────────
@@ -452,7 +484,6 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
-    # Fecha sessão HTTP externa (evita "Unclosed connector")
     global HTTP_SESSION
     with contextlib.suppress(Exception):
         if HTTP_SESSION is not None and not HTTP_SESSION.closed:
@@ -461,7 +492,6 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         await client.close()
 
-    # Railway vai reiniciar ao sair do processo
     os._exit(0)
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
@@ -478,19 +508,14 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 @client.event
 async def on_ready():
     print(f"🤖 Conectado como {client.user}")
-
     local_names = [c.name for c in tree.get_commands()]
     print("COMANDOS REGISTRADOS (local):", local_names)
 
-    # ✅ Sync corrigido: copy_global_to -> sync guild (instantâneo)
     if SYNC_COMMANDS:
         try:
             if GUILD_ID:
                 guild = discord.Object(id=int(GUILD_ID))
-
-                # 🔥 ESSA LINHA é o que faltava no seu caso
                 tree.copy_global_to(guild=guild)
-
                 synced = await tree.sync(guild=guild)
                 print(f"✅ Sync GUILD OK ({GUILD_ID}). Publicados:", [c.name for c in synced])
             else:
@@ -513,21 +538,19 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    # ✅ cria uma sessão HTTP única e injeta nos módulos que usam aiohttp
     global HTTP_SESSION
     timeout = aiohttp.ClientTimeout(total=20)
     connector = aiohttp.TCPConnector(limit=50)
     HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
     market.set_session(HTTP_SESSION)
     news.set_session(HTTP_SESSION)
     telegram.set_session(HTTP_SESSION)
 
-    # ✅ garante cleanup interno do discord.py
     async with client:
         try:
             await client.start(TOKEN)
         finally:
-            # se o processo sair "normalmente", fecha também
             with contextlib.suppress(Exception):
                 if HTTP_SESSION is not None and not HTTP_SESSION.closed:
                     await HTTP_SESSION.close()
