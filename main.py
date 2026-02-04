@@ -1,4 +1,4 @@
-# main.py (FINAL)
+# main.py (FINAL - discord.py 2.3.x compatível)
 import os
 import asyncio
 import contextlib
@@ -32,10 +32,42 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
 
 # ✅ Canal único permitido para comandos
 ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
+
+# ─────────────────────────────
+# CommandTree com check global por canal (discord.py way ✅)
+# ─────────────────────────────
+async def _deny(interaction: discord.Interaction, msg: str):
+    """Responde ephemeral sem quebrar se já respondeu."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+class AtlasTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Se não configurou CANAL_ADMIN, não trava tudo sem querer
+        if ADMIN_CHANNEL_ID <= 0:
+            return True
+
+        # Bloqueia DM
+        if interaction.guild is None:
+            await _deny(interaction, "⛔ Comandos disponíveis apenas no servidor.")
+            return False
+
+        # Trava por canal
+        if interaction.channel_id != ADMIN_CHANNEL_ID:
+            await _deny(interaction, f"⛔ Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
+            return False
+
+        return True
+
+tree = AtlasTree(client)
 
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
@@ -58,26 +90,6 @@ _SHUTTING_DOWN = False
 
 # Sessão HTTP compartilhada (CoinGecko/Yahoo/Telegram etc.)
 HTTP_SESSION: aiohttp.ClientSession | None = None
-
-
-# ─────────────────────────────
-# CHECK GLOBAL: comandos só no canal admin
-# ─────────────────────────────
-@tree.check
-async def enforce_admin_channel(interaction: discord.Interaction) -> bool:
-    # Se não configurou CANAL_ADMIN, não trava tudo sem querer
-    if ADMIN_CHANNEL_ID <= 0:
-        return True
-
-    # Bloqueia DM
-    if interaction.guild is None:
-        raise app_commands.CheckFailure("Comandos disponíveis apenas no servidor.")
-
-    # Trava por canal
-    if interaction.channel_id != ADMIN_CHANNEL_ID:
-        raise app_commands.CheckFailure(f"Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
-
-    return True
 
 
 # ─────────────────────────────
@@ -374,7 +386,6 @@ async def _run_signals_now():
         return False, "signals.py não está disponível."
     if not hasattr(signals, "scan_and_post"):
         return False, "signals.py não tem scan_and_post(client, force)."
-
     try:
         await _call_sync_or_async(signals.scan_and_post, client, True)  # force=True
         return True, "Scan de sinais executado (manual)."
@@ -426,15 +437,6 @@ async def slash_sinaisstatus(interaction: discord.Interaction):
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # ✅ Bloqueio por canal
-    if isinstance(error, app_commands.CheckFailure):
-        msg = str(error) or f"Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>."
-        if interaction.response.is_done():
-            await interaction.followup.send(f"⛔ {msg}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"⛔ {msg}", ephemeral=True)
-        return
-
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ Você não tem permissão para usar este comando."
         if interaction.response.is_done():
@@ -467,10 +469,6 @@ async def scheduler():
 
 @tasks.loop(minutes=1)
 async def signals_scheduler():
-    """
-    Dispara sinais nos minutos 00/15/30/45 (candle 15m).
-    Para cada ativo: escolhe a melhor opção (Binance vs MEXC; Spot vs Futures) e posta só a melhor.
-    """
     global ultima_sinal_slot
 
     if signals is None:
@@ -488,7 +486,7 @@ async def signals_scheduler():
 
     slot_key = agora.strftime("%Y-%m-%d %H:%M")
     if ultima_sinal_slot == slot_key:
-        return  # evita duplicar no mesmo slot
+        return
 
     if SINAIS_LOCK.locked():
         return
@@ -514,7 +512,6 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         if scheduler.is_running():
             scheduler.cancel()
-
     with contextlib.suppress(Exception):
         if signals_scheduler.is_running():
             signals_scheduler.cancel()
@@ -541,7 +538,7 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# READY + SYNC (CORRIGIDO ✅)
+# READY + SYNC
 # ─────────────────────────────
 @client.event
 async def on_ready():
