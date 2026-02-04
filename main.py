@@ -1,14 +1,14 @@
-# main.py
+# main.py (FINAL)
 import os
 import asyncio
 import contextlib
 import inspect
 import signal
+from datetime import datetime
 import aiohttp
 import discord
 import pytz
 import requests
-from datetime import datetime
 from discord.ext import tasks
 from discord import app_commands
 
@@ -17,9 +17,9 @@ import market
 import news
 import telegram
 
-# ✅ Import "signals.py" (se existir). Não derruba o bot se não existir.
+# ✅ Import signals.py (se existir). Não derruba o bot se não existir.
 try:
-    import signals  # seu arquivo signals.py
+    import signals  # precisa ter scan_and_post(client, force: bool)
 except Exception as e:
     signals = None
     print(f"⚠️ signals.py não carregou: {e}")
@@ -40,6 +40,7 @@ ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
 # Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
+ultima_sinal_slot = None  # evita duplicar sinais no mesmo minuto-slot
 
 # Rompimento
 ULTIMO_PRECO = {}      # {ativo: preco}
@@ -49,7 +50,7 @@ FALHAS_SEGUIDAS = {}   # {ativo: count}
 PUBLICACAO_LOCK = asyncio.Lock()
 SINAIS_LOCK = asyncio.Lock()
 
-# Concorrência (threads) p/ não travar o event loop com requests/feedparser
+# Concorrência p/ não travar event loop
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -160,12 +161,9 @@ async def log_bot(titulo: str, mensagem: str):
     embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
     await canal.send(embed=embed)
 
-def dolar_para_real() -> float:
+def dolar_para_real_sync() -> float:
     try:
-        r = requests.get(
-            "https://api.exchangerate.host/latest?base=USD&symbols=BRL",
-            timeout=10
-        )
+        r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=BRL", timeout=10)
         data = r.json()
         rate = data.get("rates", {}).get("BRL")
         return float(rate) if rate else 5.0
@@ -346,7 +344,7 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
         if not dados:
             return
 
-        cot = dolar_para_real()
+        cot = await asyncio.to_thread(dolar_para_real_sync)
         manchetes = await _call_sync_or_async(news.noticias) if hasattr(news, "noticias") else []
 
         canal_rel = client.get_channel(_channel_id("CANAL_ANALISE") or 0)
@@ -369,22 +367,37 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
 
 
 # ─────────────────────────────
-# SINAIS (comandos existem; execução só se signals.py suportar)
+# SINAIS
 # ─────────────────────────────
 async def _run_signals_now():
     if signals is None:
         return False, "signals.py não está disponível."
+    if not hasattr(signals, "scan_and_post"):
+        return False, "signals.py não tem scan_and_post(client, force)."
 
-    for fname in ("run_now", "sinais_agora", "enviar_agora", "publicar_agora", "scan_and_post", "scan_signals"):
-        fn = getattr(signals, fname, None)
-        if callable(fn):
-            try:
-                await _call_sync_or_async(fn, client)
-                return True, f"Executado via signals.{fname}()"
-            except Exception as e:
-                return False, f"Falha em signals.{fname}(): {e}"
+    try:
+        await _call_sync_or_async(signals.scan_and_post, client, True)  # force=True
+        return True, "Scan de sinais executado (manual)."
+    except Exception as e:
+        return False, f"Falha ao executar scan_and_post(): {e}"
 
-    return False, "Nenhuma função compatível encontrada em signals.py."
+
+# ─────────────────────────────
+# SLASH COMMANDS
+# ─────────────────────────────
+@tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_testetudo(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
+    await interaction.followup.send("✅ Disparei as publicações.", ephemeral=True)
+
+@tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_reiniciar(interaction: discord.Interaction):
+    await interaction.response.send_message("🔄 Reiniciando...", ephemeral=True)
+    await asyncio.sleep(1)
+    await shutdown("manual restart")
 
 @tree.command(name="sinaisagora", description="Força um scan/post de sinais agora (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -403,28 +416,12 @@ async def slash_sinaisstatus(interaction: discord.Interaction):
     msg = (
         f"**signals.py:** `{'OK' if signals is not None else 'INDISPONÍVEL'}`\n"
         f"**SINAIS_ATIVOS (config):** `{_get_cfg('SINAIS_ATIVOS', False)}`\n"
+        f"**SINAIS_TIMEFRAME:** `{_get_cfg('SINAIS_TIMEFRAME', '15m')}`\n"
+        f"**SINAIS_EXCHANGES:** `{_get_cfg('SINAIS_EXCHANGES', [])}`\n"
         f"**CANAL_SINAIS_SPOT:** `{_channel_id('CANAL_SINAIS_SPOT')}`\n"
         f"**CANAL_SINAIS_FUTURES:** `{_channel_id('CANAL_SINAIS_FUTURES')}`"
     )
     await interaction.response.send_message(msg, ephemeral=True)
-
-
-# ─────────────────────────────
-# SLASH COMMANDS (base)
-# ─────────────────────────────
-@tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testetudo(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
-    await interaction.followup.send("✅ Disparei as publicações.", ephemeral=True)
-
-@tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_reiniciar(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Reiniciando...", ephemeral=True)
-    await asyncio.sleep(1)
-    await shutdown("manual restart")
 
 
 @tree.error
@@ -451,7 +448,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ─────────────────────────────
-# SCHEDULER (06h / 18h) — BRASIL
+# SCHEDULERS
 # ─────────────────────────────
 @tasks.loop(minutes=1)
 async def scheduler():
@@ -468,6 +465,43 @@ async def scheduler():
         ultima_tarde = agora.date()
 
 
+@tasks.loop(minutes=1)
+async def signals_scheduler():
+    """
+    Dispara sinais nos minutos 00/15/30/45 (candle 15m).
+    Para cada ativo: escolhe a melhor opção (Binance vs MEXC; Spot vs Futures) e posta só a melhor.
+    """
+    global ultima_sinal_slot
+
+    if signals is None:
+        return
+    if not _get_cfg("SINAIS_ATIVOS", False):
+        return
+    if not hasattr(signals, "scan_and_post"):
+        return
+
+    agora = datetime.now(BR_TZ)
+
+    # somente nos minutos 00/15/30/45
+    if agora.minute % 15 != 0:
+        return
+
+    slot_key = agora.strftime("%Y-%m-%d %H:%M")
+    if ultima_sinal_slot == slot_key:
+        return  # evita duplicar no mesmo slot
+
+    if SINAIS_LOCK.locked():
+        return
+
+    async with SINAIS_LOCK:
+        try:
+            await _call_sync_or_async(signals.scan_and_post, client, False)  # force=False
+        except Exception as e:
+            await log_bot("SignalsScheduler", f"Erro: {e}")
+
+    ultima_sinal_slot = slot_key
+
+
 # ─────────────────────────────
 # SHUTDOWN / SIGNALS
 # ─────────────────────────────
@@ -480,6 +514,10 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         if scheduler.is_running():
             scheduler.cancel()
+
+    with contextlib.suppress(Exception):
+        if signals_scheduler.is_running():
+            signals_scheduler.cancel()
 
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
@@ -526,6 +564,9 @@ async def on_ready():
 
     if not scheduler.is_running():
         scheduler.start()
+
+    if not signals_scheduler.is_running():
+        signals_scheduler.start()
 
 
 # ─────────────────────────────
