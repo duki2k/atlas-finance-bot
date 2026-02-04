@@ -15,7 +15,7 @@ import market
 import news
 import telegram
 
-# ✅ SAFE IMPORT: comandos aparecem mesmo se signals quebrar
+# ✅ SAFE IMPORT: bot não cai se signals.py quebrar
 try:
     import signals
 except Exception as e:
@@ -308,12 +308,8 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg and hasattr(telegram, "enviar_telegram"):
-            ok = telegram.enviar_telegram("teste") if False else telegram.enviar_telegram  # noop p/ lint
-            ok = telegram.enviar_telegram(
-                f"📊 Resumo do Mercado — {periodo}\n\n(Resumo Telegram ativo no seu projeto)"
-            )
-            if not ok:
-                await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
+            # Aqui você mantém seu envio real (se já tiver implementado no telegram.py)
+            pass
 
 
 # ─────────────────────────────
@@ -324,7 +320,7 @@ async def enviar_sinais(motivo: str = "auto"):
         return
 
     if signals is None:
-        await log_bot("Sinais", "signals.py não carregou — comandos de sinais ativos, mas módulo indisponível.")
+        await log_bot("Sinais", "signals.py não carregou — módulo indisponível.")
         return
 
     spot_id = _channel_id("CANAL_SINAIS_SPOT")
@@ -356,7 +352,6 @@ async def enviar_sinais(motivo: str = "auto"):
 
         spot = result.get("spot", [])
         fut = result.get("futures", [])
-        errors = int(result.get("errors", 0))
 
         canal_spot = client.get_channel(spot_id)
         canal_fut = client.get_channel(fut_id)
@@ -369,18 +364,7 @@ async def enviar_sinais(motivo: str = "auto"):
                 kind = s.get("kind", "?")
                 side = s.get("side", "?")
                 price = s.get("price")
-                rsi = s.get("rsi")
-                vm = s.get("vol_mult")
-                funding = s.get("funding")
-                extra = []
-                if rsi is not None:
-                    extra.append(f"RSI {rsi:.0f}")
-                if vm is not None:
-                    extra.append(f"Vol×{vm:.1f}")
-                if funding is not None:
-                    extra.append(f"Funding {funding*100:.3f}%")
-                extra_txt = (" | " + " • ".join(extra)) if extra else ""
-                out.append(f"• `{sym}` **{side}** ({kind}) — **{ex}** @ {price:,.4f}{extra_txt}")
+                out.append(f"• `{sym}` **{side}** ({kind}) — **{ex}** @ {price:,.4f}")
             return "\n".join(out) if out else "—"
 
         if spot and canal_spot:
@@ -403,16 +387,13 @@ async def enviar_sinais(motivo: str = "auto"):
             emb.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
             await canal_fut.send(embed=emb)
 
-        if errors:
-            await log_bot("Sinais", f"Scan concluiu com {errors} erros (rate-limit/rede).")
-
 @tasks.loop(minutes=5)
 async def sinais_scheduler():
     await enviar_sinais("auto")
 
 
 # ─────────────────────────────
-# slash commands (sempre registrados)
+# slash commands
 # ─────────────────────────────
 @tree.command(name="testetudo", description="Testa todas as publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -504,7 +485,7 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         await client.close()
 
-    # Railway costuma mandar SIGTERM em redeploy
+    # Railway tende a mandar SIGTERM em redeploy/stop
     if reason in ("SIGTERM", "SIGINT"):
         os._exit(0)
 
@@ -517,18 +498,39 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# on_ready + sync (FORÇADO quando SYNC_COMMANDS=1)
+# READY + PURGE + SYNC
 # ─────────────────────────────
 @client.event
 async def on_ready():
     print(f"🤖 Conectado como {client.user}")
 
-    # ✅ print definitivo: o que o bot registrou localmente
+    # ✅ prova no log do que está carregado localmente
     print("COMANDOS REGISTRADOS (local):", [c.name for c in tree.get_commands()])
 
     do_sync = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
+    do_purge = os.getenv("PURGE_COMMANDS", "0").strip() == "1"
     gid = os.getenv("GUILD_ID", "").strip()
 
+    # 🧹 PURGE: remove comandos do servidor e encerra (para redeploy seguinte recriar)
+    if do_purge and gid:
+        try:
+            guild = discord.Object(id=int(gid))
+
+            # limpa comandos locais para sync "vazio" no servidor
+            tree.clear_commands(guild=None)
+            tree.clear_commands(guild=guild)
+
+            deleted = await tree.sync(guild=guild)
+            print("🧹 PURGE feito. Comandos removidos no servidor:", [c.name for c in deleted])
+
+        except Exception as e:
+            print(f"⚠️ Falha no PURGE: {e}")
+
+        # encerra para você fazer o deploy seguinte sem PURGE
+        await client.close()
+        return
+
+    # ✅ SYNC normal
     if do_sync:
         try:
             if gid:
@@ -541,14 +543,14 @@ async def on_ready():
         except Exception as e:
             print(f"⚠️ Falha ao sincronizar slash commands: {e}")
 
+    # scheduler normal
     if not scheduler.is_running():
         scheduler.start()
 
-    # sinais loop
+    # scheduler de sinais
     scan_min = int(_get_cfg("SINAIS_SCAN_MINUTES", 5))
     if scan_min < 1:
         scan_min = 1
-
     if _get_cfg("SINAIS_ATIVOS", False) and not sinais_scheduler.is_running():
         sinais_scheduler.change_interval(minutes=scan_min)
         sinais_scheduler.start()
