@@ -88,4 +88,39 @@ TRADING_NEWS_TIMES = env_str("TRADING_NEWS_TIMES", "08:00,14:00,20:00")
 TRADING_DAILY_SUMMARY_ATIVO = env_bool("TRADING_DAILY_SUMMARY_ATIVO", False)
 TRADING_DAILY_SUMMARY_TIME = env_str("TRADING_DAILY_SUMMARY_TIME", "21:00")
 
+# ─────────────────────────────
+# SINAIS (SPOT + FUTURES) — v1 (educacional)
+# ─────────────────────────────
+
+# IDs dos canais (OBRIGATÓRIO)
+CANAL_SINAIS_SPOT = 1468294566024052800        # coloque o ID do canal #sinais-spot
+CANAL_SINAIS_FUTURES = 1468461753431228457     # coloque o ID do canal #sinais-futures
+
+# Liga/desliga
+SINAIS_ATIVOS = True
+
+# A cada quantos minutos varrer o mercado
+SINAIS_SCAN_MINUTES = 5
+
+# Timeframe analisado (15m recomendado)
+SINAIS_TIMEFRAME = "15m"
+
+# Pares monitorados (começa pequeno pra não rate-limitar)
+SINAIS_PARES = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+]
+
+# Exchanges a consultar (você pode reduzir pra ["binance"] se quiser)
+SINAIS_EXCHANGES = ["binance", "mexc"]
+
+# Cooldown por sinal (evita spam repetido)
+SINAIS_COOLDOWN_MINUTES = 60
+
+# Limites anti-spam por ciclo
+SINAIS_MAX_POR_CICLO_SPOT = 8
+SINAIS_MAX_POR_CICLO_FUTURES = 8
 
