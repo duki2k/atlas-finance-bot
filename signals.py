@@ -348,3 +348,4 @@ def scan_signals(
             time.sleep(0.15)
 
     return {"spot": spot_out, "futures": fut_out, "errors": errors}
+
