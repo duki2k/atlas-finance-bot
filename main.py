@@ -2,6 +2,7 @@
 import os
 import asyncio
 import contextlib
+import inspect
 import signal
 import discord
 import pytz
@@ -15,37 +16,44 @@ import market
 import news
 import telegram
 
-# ✅ SAFE IMPORT: bot não cai se signals.py quebrar
+# ✅ Import "signals.py" (se existir). Não derruba o bot se não existir.
 try:
-    import signals
+    import signals  # seu arquivo signals.py
 except Exception as e:
     signals = None
     print(f"⚠️ signals.py não carregou: {e}")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = (os.getenv("GUILD_ID") or "").strip()
+SYNC_COMMANDS = (os.getenv("SYNC_COMMANDS") or "0").strip() == "1"
+
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Scheduler controle
+# Controle scheduler (para não disparar 2x no mesmo dia)
 ultima_manha = None
 ultima_tarde = None
 
 # Rompimento
-ULTIMO_PRECO = {}
-FALHAS_SEGUIDAS = {}
+ULTIMO_PRECO = {}      # {ativo: preco}
+FALHAS_SEGUIDAS = {}   # {ativo: count}
 
-# Locks anti-overlap
+# Anti-overlap
 PUBLICACAO_LOCK = asyncio.Lock()
 SINAIS_LOCK = asyncio.Lock()
+
+# Concorrência (threads) p/ não travar o event loop com requests/feedparser
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
+SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
 _SHUTTING_DOWN = False
 
 
 # ─────────────────────────────
-# helpers config
+# Helpers
 # ─────────────────────────────
 def _get_cfg(name: str, default=None):
     return getattr(config, name, default)
@@ -58,9 +66,19 @@ def _channel_id(name: str):
     except Exception:
         return None
 
+async def _maybe_await(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+async def _call_sync_or_async(fn, *args, **kwargs):
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
+
 
 # ─────────────────────────────
-# util
+# UTIL
 # ─────────────────────────────
 def emoji_var(v: float) -> str:
     if v is None:
@@ -117,7 +135,10 @@ async def log_bot(titulo: str, mensagem: str):
 
 def dolar_para_real() -> float:
     try:
-        r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=BRL", timeout=10)
+        r = requests.get(
+            "https://api.exchangerate.host/latest?base=USD&symbols=BRL",
+            timeout=10
+        )
         data = r.json()
         rate = data.get("rates", {}).get("BRL")
         return float(rate) if rate else 5.0
@@ -126,7 +147,7 @@ def dolar_para_real() -> float:
 
 
 # ─────────────────────────────
-# rompimento
+# ALERTA URGENTE (ROMPIMENTO)
 # ─────────────────────────────
 async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
     cid = _channel_id("CANAL_NOTICIAS")
@@ -136,6 +157,7 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
 
     preco_antigo = ULTIMO_PRECO.get(ativo)
     ULTIMO_PRECO[ativo] = preco_atual
+
     if preco_antigo is None or preco_antigo <= 0:
         return
 
@@ -156,49 +178,54 @@ async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
     embed.add_field(name="Preço atual", value=f"{preco_atual:,.4f}", inline=True)
     embed.add_field(name="Movimento", value=f"{var:+.2f}% {emoji_var(var)}", inline=False)
     embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
+
     await canal.send(embed=embed)
 
 
 # ─────────────────────────────
-# coleta (estável)
+# COLETA (não bloqueia event loop)
 # ─────────────────────────────
-async def coletar_lote(categoria: str, ativos: list[str], delay: float = 0.25):
-    itens = []
-    for ativo in ativos:
+async def _fetch_one(categoria: str, ativo: str):
+    async with SEM:
         try:
-            p, v = market.dados_ativo(ativo)
+            p, v = await _call_sync_or_async(market.dados_ativo, ativo)
 
+            # FIIs: se preço não veio, ignora sem log
             if ativo.endswith("11.SA") and p is None:
-                await asyncio.sleep(delay)
-                continue
+                return None
 
             if p is None or v is None:
                 FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
                 if FALHAS_SEGUIDAS[ativo] >= 3:
                     await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
                     FALHAS_SEGUIDAS[ativo] = 0
-                await asyncio.sleep(delay)
-                continue
+                return None
 
             FALHAS_SEGUIDAS[ativo] = 0
-            itens.append((ativo, float(p), float(v)))
             await alerta_rompimento(ativo, float(p), categoria)
+            return (ativo, float(p), float(v))
 
         except Exception as e:
             await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{e}")
-
-        await asyncio.sleep(delay)
-
-    return itens
+            return None
 
 async def coletar_dados():
+    coros = []
+    order = []
+    for categoria, ativos in config.ATIVOS.items():
+        for ativo in ativos:
+            coros.append(_fetch_one(categoria, ativo))
+            order.append((categoria, ativo))
+
+    results = await asyncio.gather(*coros, return_exceptions=False)
+
     dados = {}
     total = 0
-    for categoria, ativos in config.ATIVOS.items():
-        lote = await coletar_lote(categoria, ativos)
-        if lote:
-            dados[categoria] = lote
-            total += len(lote)
+    for (categoria, _), item in zip(order, results):
+        if not item:
+            continue
+        dados.setdefault(categoria, []).append(item)
+        total += 1
 
     if total == 0:
         await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
@@ -207,10 +234,11 @@ async def coletar_dados():
 
 
 # ─────────────────────────────
-# embeds
+# EMBEDS
 # ─────────────────────────────
 def embed_relatorio(dados: dict, cot: float):
     moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
+
     altas = sum(1 for _, _, v in moves if v > 0)
     quedas = sum(1 for _, _, v in moves if v < 0)
     sent_label, cor = sentimento_geral(altas, quedas)
@@ -279,7 +307,7 @@ def embed_jornal(manchetes: list[str], periodo: str):
 
 
 # ─────────────────────────────
-# publicações
+# PUBLICAÇÕES
 # ─────────────────────────────
 async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
     if PUBLICACAO_LOCK.locked():
@@ -292,7 +320,7 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             return
 
         cot = dolar_para_real()
-        manchetes = news.noticias() if hasattr(news, "noticias") else []
+        manchetes = await _call_sync_or_async(news.noticias) if hasattr(news, "noticias") else []
 
         canal_rel = client.get_channel(_channel_id("CANAL_ANALISE") or 0)
         canal_j = client.get_channel(_channel_id("CANAL_NOTICIAS") or 0)
@@ -308,99 +336,63 @@ async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
             await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
 
         if enviar_tg and hasattr(telegram, "enviar_telegram"):
-            # Aqui você mantém seu envio real (se já tiver implementado no telegram.py)
-            pass
+            # compatível com sync OU async
+            ok = await _maybe_await(telegram.enviar_telegram(f"📌 Atlas Finance — {periodo}"))
+            if ok is False:
+                await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
 
 
 # ─────────────────────────────
-# sinais
+# SINAIS (comandos existem; execução só se signals.py suportar)
 # ─────────────────────────────
-async def enviar_sinais(motivo: str = "auto"):
-    if not _get_cfg("SINAIS_ATIVOS", False):
-        return
-
+async def _run_signals_now():
     if signals is None:
-        await log_bot("Sinais", "signals.py não carregou — módulo indisponível.")
-        return
+        return False, "signals.py não está disponível."
 
-    spot_id = _channel_id("CANAL_SINAIS_SPOT")
-    fut_id = _channel_id("CANAL_SINAIS_FUTURES")
-    if not spot_id or not fut_id:
-        await log_bot("Sinais", "Canais não configurados (CANAL_SINAIS_SPOT / CANAL_SINAIS_FUTURES).")
-        return
+    # tenta achar uma função padrão no seu signals.py
+    for fname in ("run_now", "sinais_agora", "enviar_agora", "publicar_agora", "scan_and_post", "scan_signals"):
+        fn = getattr(signals, fname, None)
+        if callable(fn):
+            try:
+                await _call_sync_or_async(fn, client)
+                return True, f"Executado via signals.{fname}()"
+            except Exception as e:
+                return False, f"Falha em signals.{fname}(): {e}"
 
+    return False, "Nenhuma função compatível encontrada em signals.py."
+
+@tree.command(name="sinaisagora", description="Força um scan/post de sinais agora (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_sinaisagora(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
     if SINAIS_LOCK.locked():
+        await interaction.followup.send("⏳ Já tem um scan em andamento.", ephemeral=True)
         return
-
     async with SINAIS_LOCK:
-        timeframe = _get_cfg("SINAIS_TIMEFRAME", "15m")
-        pares = _get_cfg("SINAIS_PARES", ["BTCUSDT", "ETHUSDT"])
-        exchanges = _get_cfg("SINAIS_EXCHANGES", ["binance"])
-        cooldown = int(_get_cfg("SINAIS_COOLDOWN_MINUTES", 60))
-        max_spot = int(_get_cfg("SINAIS_MAX_POR_CICLO_SPOT", 8))
-        max_fut = int(_get_cfg("SINAIS_MAX_POR_CICLO_FUTURES", 8))
+        ok, msg = await _run_signals_now()
+        await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
 
-        result = await asyncio.to_thread(
-            signals.scan_signals,
-            pares,
-            timeframe,
-            exchanges,
-            cooldown,
-            max_spot,
-            max_fut,
-        )
-
-        spot = result.get("spot", [])
-        fut = result.get("futures", [])
-
-        canal_spot = client.get_channel(spot_id)
-        canal_fut = client.get_channel(fut_id)
-
-        def mk_lines(items):
-            out = []
-            for s in items[:12]:
-                ex = s.get("exchange", "?").upper()
-                sym = s.get("symbol", "?")
-                kind = s.get("kind", "?")
-                side = s.get("side", "?")
-                price = s.get("price")
-                out.append(f"• `{sym}` **{side}** ({kind}) — **{ex}** @ {price:,.4f}")
-            return "\n".join(out) if out else "—"
-
-        if spot and canal_spot:
-            emb = discord.Embed(
-                title=f"📌 Sinais SPOT — {motivo}",
-                description=f"⏱️ Timeframe: **{timeframe}**\n🧠 Educacional — confirme no gráfico.",
-                color=0x2ECC71
-            )
-            emb.add_field(name="Sinais", value=mk_lines(spot), inline=False)
-            emb.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
-            await canal_spot.send(embed=emb)
-
-        if fut and canal_fut:
-            emb = discord.Embed(
-                title=f"⚡ Sinais FUTURES — {motivo}",
-                description=f"⏱️ Timeframe: **{timeframe}**\n🧠 Educacional — confirme no gráfico.",
-                color=0xE74C3C
-            )
-            emb.add_field(name="Sinais", value=mk_lines(fut), inline=False)
-            emb.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
-            await canal_fut.send(embed=emb)
-
-@tasks.loop(minutes=5)
-async def sinais_scheduler():
-    await enviar_sinais("auto")
+@tree.command(name="sinaisstatus", description="Mostra status dos sinais (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_sinaisstatus(interaction: discord.Interaction):
+    msg = (
+        f"**signals.py:** `{'OK' if signals is not None else 'INDISPONÍVEL'}`\n"
+        f"**SINAIS_ATIVOS (config):** `{_get_cfg('SINAIS_ATIVOS', False)}`\n"
+        f"**CANAL_SINAIS_SPOT:** `{_channel_id('CANAL_SINAIS_SPOT')}`\n"
+        f"**CANAL_SINAIS_FUTURES:** `{_channel_id('CANAL_SINAIS_FUTURES')}`"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 # ─────────────────────────────
-# slash commands
+# SLASH COMMANDS (base)
 # ─────────────────────────────
-@tree.command(name="testetudo", description="Testa todas as publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
+@tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_testetudo(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
-    await interaction.followup.send("✅ OK", ephemeral=True)
+    await interaction.followup.send("✅ Disparei as publicações.", ephemeral=True)
 
 @tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -409,34 +401,11 @@ async def slash_reiniciar(interaction: discord.Interaction):
     await asyncio.sleep(1)
     await shutdown("manual restart")
 
-@tree.command(name="sinaisagora", description="Força um scan de sinais (SPOT + FUTURES) agora (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_sinaisagora(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    await enviar_sinais("manual")
-    await interaction.followup.send("✅ Scan de sinais executado.", ephemeral=True)
-
-@tree.command(name="sinaisstatus", description="Mostra o status/config dos sinais (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_sinaisstatus(interaction: discord.Interaction):
-    spot_id = _channel_id("CANAL_SINAIS_SPOT")
-    fut_id = _channel_id("CANAL_SINAIS_FUTURES")
-    msg = (
-        f"**signals.py:** `{'OK' if signals is not None else 'ERRO'}`\n"
-        f"**SINAIS_ATIVOS:** `{_get_cfg('SINAIS_ATIVOS', False)}`\n"
-        f"**TIMEFRAME:** `{_get_cfg('SINAIS_TIMEFRAME', '15m')}`\n"
-        f"**SCAN_MINUTES:** `{_get_cfg('SINAIS_SCAN_MINUTES', 5)}`\n"
-        f"**EXCHANGES:** `{_get_cfg('SINAIS_EXCHANGES', ['binance'])}`\n"
-        f"**PARES:** `{len(_get_cfg('SINAIS_PARES', []))}`\n"
-        f"**CANAL_SPOT:** `{spot_id}`\n"
-        f"**CANAL_FUTURES:** `{fut_id}`"
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ Sem permissão."
+        msg = "❌ Você não tem permissão para usar este comando."
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
@@ -446,7 +415,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # ─────────────────────────────
-# scheduler 06/18
+# SCHEDULER (06h / 18h) — BRASIL
 # ─────────────────────────────
 @tasks.loop(minutes=1)
 async def scheduler():
@@ -464,7 +433,7 @@ async def scheduler():
 
 
 # ─────────────────────────────
-# shutdown + signals
+# SHUTDOWN / SIGNALS
 # ─────────────────────────────
 async def shutdown(reason: str):
     global _SHUTTING_DOWN
@@ -475,9 +444,6 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         if scheduler.is_running():
             scheduler.cancel()
-    with contextlib.suppress(Exception):
-        if sinais_scheduler.is_running():
-            sinais_scheduler.cancel()
 
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
@@ -485,9 +451,8 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         await client.close()
 
-    # Railway tende a mandar SIGTERM em redeploy/stop
-    if reason in ("SIGTERM", "SIGINT"):
-        os._exit(0)
+    # Railway vai reiniciar ao sair do processo
+    os._exit(0)
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop):
     def _handler(sig_name: str):
@@ -498,76 +463,49 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# READY + PURGE + SYNC
+# READY + SYNC (CORRIGIDO ✅)
 # ─────────────────────────────
 @client.event
 async def on_ready():
     print(f"🤖 Conectado como {client.user}")
 
-    # ✅ prova no log do que está carregado localmente
-    print("COMANDOS REGISTRADOS (local):", [c.name for c in tree.get_commands()])
+    local_names = [c.name for c in tree.get_commands()]
+    print("COMANDOS REGISTRADOS (local):", local_names)
 
-    do_sync = os.getenv("SYNC_COMMANDS", "0").strip() == "1"
-    do_purge = os.getenv("PURGE_COMMANDS", "0").strip() == "1"
-    gid = os.getenv("GUILD_ID", "").strip()
-
-    # 🧹 PURGE: remove comandos do servidor e encerra (para redeploy seguinte recriar)
-    if do_purge and gid:
+    # ✅ Sync corrigido: copy_global_to -> sync guild (instantâneo)
+    if SYNC_COMMANDS:
         try:
-            guild = discord.Object(id=int(gid))
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
 
-            # limpa comandos locais para sync "vazio" no servidor
-            tree.clear_commands(guild=None)
-            tree.clear_commands(guild=guild)
+                # 🔥 ESSA LINHA é o que faltava no seu caso
+                tree.copy_global_to(guild=guild)
 
-            deleted = await tree.sync(guild=guild)
-            print("🧹 PURGE feito. Comandos removidos no servidor:", [c.name for c in deleted])
-
-        except Exception as e:
-            print(f"⚠️ Falha no PURGE: {e}")
-
-        # encerra para você fazer o deploy seguinte sem PURGE
-        await client.close()
-        return
-
-    # ✅ SYNC normal
-    if do_sync:
-        try:
-            if gid:
-                guild = discord.Object(id=int(gid))
-                await tree.sync(guild=guild)
-                print(f"✅ Slash commands sincronizados no servidor {gid}")
+                synced = await tree.sync(guild=guild)
+                print(f"✅ Sync GUILD OK ({GUILD_ID}). Publicados:", [c.name for c in synced])
             else:
-                await tree.sync()
-                print("✅ Slash commands sincronizados globalmente (pode demorar)")
+                synced = await tree.sync()
+                print("✅ Sync GLOBAL OK. Publicados:", [c.name for c in synced])
         except Exception as e:
             print(f"⚠️ Falha ao sincronizar slash commands: {e}")
 
-    # scheduler normal
     if not scheduler.is_running():
         scheduler.start()
 
-    # scheduler de sinais
-    scan_min = int(_get_cfg("SINAIS_SCAN_MINUTES", 5))
-    if scan_min < 1:
-        scan_min = 1
-    if _get_cfg("SINAIS_ATIVOS", False) and not sinais_scheduler.is_running():
-        sinais_scheduler.change_interval(minutes=scan_min)
-        sinais_scheduler.start()
-
 
 # ─────────────────────────────
-# entry
+# ENTRYPOINT ROBUSTO
 # ─────────────────────────────
 async def main():
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN não definido.")
+
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
-    await client.start(TOKEN)
+
+    # ✅ garante cleanup interno do discord.py
+    async with client:
+        await client.start(TOKEN)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
