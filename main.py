@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import signal
+import aiohttp
 import discord
 import pytz
 import requests
@@ -50,6 +51,9 @@ MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
 SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 
 _SHUTTING_DOWN = False
+
+# Sessão HTTP compartilhada (CoinGecko/Yahoo/Telegram etc.)
+HTTP_SESSION: aiohttp.ClientSession | None = None
 
 
 # ─────────────────────────────
@@ -448,6 +452,12 @@ async def shutdown(reason: str):
     with contextlib.suppress(Exception):
         await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
 
+    # Fecha sessão HTTP externa (evita "Unclosed connector")
+    global HTTP_SESSION
+    with contextlib.suppress(Exception):
+        if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+            await HTTP_SESSION.close()
+
     with contextlib.suppress(Exception):
         await client.close()
 
@@ -503,9 +513,24 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
+    # ✅ cria uma sessão HTTP única e injeta nos módulos que usam aiohttp
+    global HTTP_SESSION
+    timeout = aiohttp.ClientTimeout(total=20)
+    connector = aiohttp.TCPConnector(limit=50)
+    HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    market.set_session(HTTP_SESSION)
+    news.set_session(HTTP_SESSION)
+    telegram.set_session(HTTP_SESSION)
+
     # ✅ garante cleanup interno do discord.py
     async with client:
-        await client.start(TOKEN)
+        try:
+            await client.start(TOKEN)
+        finally:
+            # se o processo sair "normalmente", fecha também
+            with contextlib.suppress(Exception):
+                if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+                    await HTTP_SESSION.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
