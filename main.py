@@ -15,7 +15,12 @@ import config
 import market
 import news
 import telegram
-import signals  # ✅ novo
+try:
+    import signals
+except Exception as e:
+    signals = None
+    print(f"⚠️ signals indisponível: {e}")
+
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
