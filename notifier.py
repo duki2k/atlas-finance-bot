@@ -37,7 +37,7 @@ class Notifier:
         try:
             url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
             payload = {"chat_id": self.tg_chat, "text": text, "disable_web_page_preview": True}
-            async with self.session.post(url, json=payload, timeout=12) as r:
+            async with self.session.post(url, json=payload, timeout=15) as r:
                 await r.text()
         except Exception:
             return
