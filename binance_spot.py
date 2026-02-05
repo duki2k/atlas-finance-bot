@@ -1,18 +1,13 @@
-# binance_spot.py (Atlas Radar v3)
 from __future__ import annotations
 import random
 import asyncio
 import aiohttp
 from typing import Any, List, Tuple
 
-BASES = [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-]
+BASES = ["https://data-api.binance.vision", "https://api.binance.com"]
+HEADERS = {"User-Agent": "AtlasRadarPro/3.1"}
 
-HEADERS = {"User-Agent": "AtlasRadar/3.0"}
-
-def _to_f(x) -> float | None:
+def _to_f(x):
     try:
         return float(x)
     except Exception:
@@ -36,17 +31,13 @@ class BinanceSpot:
                 await asyncio.sleep((0.25 * (2 ** i)) + random.uniform(0, 0.2))
         return {"_error": str(last) if last else "unknown"}
 
-    async def klines(self, symbol: str, interval: str, limit: int) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
-        """
-        Retorna: open_times(ms), opens, highs, lows, closes, volumes
-        """
+    async def klines(self, symbol: str, interval: str, limit: int) -> Tuple[List[int], List[float], List[float], List[float], List[float], List[float]]:
         j = await self._get_json("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         if not isinstance(j, list):
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
         t, o, h, l, c, v = [], [], [], [], [], []
         for row in j:
-            # row: [open_time, open, high, low, close, volume, ...]
             ot = int(row[0])
             oo = _to_f(row[1]); hh = _to_f(row[2]); ll = _to_f(row[3]); cc = _to_f(row[4]); vv = _to_f(row[5])
             if None in (oo, hh, ll, cc, vv):
