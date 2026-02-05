@@ -1,62 +1,73 @@
-# config.py (Atlas Radar v3 - SPOT)
-# ✅ Ajuste os IDs abaixo
+# config.py — Atlas Radar Pro (SPOT-only)
 
 # Canal onde comandos podem ser executados (admin-bot)
-CANAL_ADMIN = 1467296892256911493
+CANAL_ADMIN = 1467296892256911493  # <- ID do canal admin-bot
 
-# Canais onde o bot publica alertas e pulso
-CANAL_ALERTAS = 1466255506657251469  # <- coloque o ID do canal #alertas
-CANAL_PULSO   = 1468294566024052800  # <- coloque o ID do canal #pulso (pode ser o mesmo)
-CANAL_LOGS    = 1467579765274837064  # opcional
+# Canais (restrinja por cargo no Discord: permissões do canal)
+CANAL_MEMBRO = 1468294566024052800       # <- canal somente cargo MEMBRO (4h)
+CANAL_INVESTIDOR = 1468861013138079859   # <- canal somente cargo INVESTIDOR (1m/5m/15m)
+CANAL_LOGS = 1467579765274837064         # opcional
 
-# (Opcional) Ping de cargo em alertas: coloque 0 pra não pingar
-ROLE_PING_ID = 0  # ex: 123456789012345678
+# Opcional: pingar cargos nas mensagens (0 = não pingar)
+ROLE_MEMBRO_ID = 1467902779447316512
+ROLE_INVESTIDOR_ID = 1467782321095577821
 
 # Telegram
-TELEGRAM_ENABLED = True  # se não tiver token/chat_id, deixa True mesmo (o código falha silencioso)
-# Tokens ficam em ENV: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+TELEGRAM_ENABLED = True
+# ENV: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 
-# Radar
+# Liga/desliga motores
 RADAR_ENABLED = True
-SCAN_EVERY_SECONDS = 60  # “alertas o tempo todo” = scaneia a cada 1 minuto
 
-# Watchlist SPOT (Binance symbols)
-WATCHLIST = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-]
+# Watchlists
+WATCHLIST_MEMBRO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+WATCHLIST_INVESTIDOR = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
-# ─────────────────────────────
-# Regras de alerta (SPOT)
-# ─────────────────────────────
-# 1) Spike 5m: variação percentual em 5 minutos
-SPIKE_5M_DEFAULT_PCT = 0.80  # padrão
-SPIKE_5M_PCT = {             # overrides por ativo (opcional)
-    "BTCUSDT": 0.60,
-    "ETHUSDT": 0.75,
+# Frequências
+SCAN_SECONDS = 10  # loop interno (não é alerta). Alertas disparam por “slot” de candle.
+
+# Regras por timeframe
+RULES = {
+    "1m":  {"lookback": 30, "vol_mult": 1.20, "atr_period": 14},
+    "5m":  {"lookback": 24, "vol_mult": 1.25, "atr_period": 14},
+    "15m": {"lookback": 20, "vol_mult": 1.30, "atr_period": 14},
+    "4h":  {"lookback": 20, "vol_mult": 1.10, "atr_period": 14},
 }
 
-# 2) Breakout/Breakdown 15m (rompe máxima/mínima 20 candles) + volume
-BREAK_15M_LOOKBACK = 20
-BREAK_15M_VOL_MULT = 1.30
-
-# 3) Tendência 15m (EMA9 x EMA21 cross)
 EMA_FAST = 9
 EMA_SLOW = 21
 
 # Anti-spam
-MAX_ALERTS_PER_CYCLE = 5
-
-COOLDOWN_MINUTES = {
-    "SPIKE_5M": 10,
-    "BREAKOUT_15M": 45,
-    "BREAKDOWN_15M": 45,
-    "EMA_CROSS_15M": 60,
+MAX_ALERTS_PER_CYCLE = {
+    "investidor": 6,
+    "membro": 3,
 }
 
-# Pulso (mensagem “profissional” recorrente com o que observar)
-PULSE_ENABLED = True
-PULSE_TIMES_BRT = ["06:05", "12:05", "18:05", "22:05"]  # horários Brasil
+COOLDOWN_MINUTES = {
+    # investidor
+    ("investidor", "1m",  "SPIKE"): 10,
+    ("investidor", "1m",  "BREAK"): 20,
+    ("investidor", "1m",  "EMA"):   45,
+
+    ("investidor", "5m",  "SPIKE"): 20,
+    ("investidor", "5m",  "BREAK"): 45,
+    ("investidor", "5m",  "EMA"):   60,
+
+    ("investidor", "15m", "SPIKE"): 45,
+    ("investidor", "15m", "BREAK"): 90,
+    ("investidor", "15m", "EMA"):   120,
+
+    # membro (4h)
+    ("membro", "4h", "BREAK"): 360,
+    ("membro", "4h", "EMA"):   360,
+}
+
+# Trigger de “spike” (educacional)
+SPIKE_PCT = {
+    "1m": 0.35,   # mudança rápida (últimos 5 minutos via 1m closes)
+    "5m": 0.80,   # último candle 5m
+    "15m": 1.20,  # último candle 15m
+}
+
+# Slots de envio “membro” (4h) — minuto fixo pra ficar bonito
+MEMBRO_MINUTE = 5  # envia em 00:05, 04:05, 08:05, ...
