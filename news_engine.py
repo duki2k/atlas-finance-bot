@@ -18,8 +18,8 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 def _clean_text(text: str) -> str:
     if not text:
         return ""
-    text = html.unescape(text)                 # corrige &#224; etc
-    text = re.sub(r"<[^>]+>", " ", text)       # remove HTML tags
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -71,43 +71,59 @@ class NewsEngine:
                 if key in self.seen:
                     continue
 
-                out.append(
-                    NewsItem(
-                        source=source,
-                        title=_short(title, 140),
-                        summary=_short(summary, 240),
-                    )
-                )
+                out.append(NewsItem(source=source, title=_short(title, 140), summary=_short(summary, 240)))
                 if len(out) >= max_items:
                     return out
 
         return out
 
-    async def _deepl_translate_batch(self, session, texts: List[str], target_lang: str) -> List[str]:
-        key = (os.getenv("DEEPL_API_KEY") or "").strip()
-        if not key:
-            return texts
+    async def _libre_translate_batch(self, session, texts: List[str], source_lang: str, target_lang: str) -> Tuple[List[str], bool]:
+        """
+        Usa LibreTranslate se LIBRETRANSLATE_URL estiver configurado.
+        Retorna (texts_traduzidos, used=True/False)
+        """
+        base = (os.getenv("LIBRETRANSLATE_URL") or "").strip()
+        if not base:
+            return texts, False
 
-        url = (os.getenv("DEEPL_API_URL") or "https://api-free.deepl.com/v2/translate").strip()
+        # exemplo: https://seu-libretranslate.railway.app
+        url = base.rstrip("/") + "/translate"
+        api_key = (os.getenv("LIBRETRANSLATE_API_KEY") or "").strip()  # opcional
 
-        data = [("auth_key", key), ("target_lang", target_lang), ("source_lang", "EN")]
+        out = []
+        used = True
+
+        # faz em lote, mas como o Libre nem sempre aceita “array” padronizado em todas distros,
+        # enviamos 1 por 1 com timeout curto (seguro e simples).
         for t in texts:
-            data.append(("text", t))
+            payload = {
+                "q": t,
+                "source": source_lang,
+                "target": target_lang,
+                "format": "text",
+            }
+            if api_key:
+                payload["api_key"] = api_key
+            try:
+                async with session.post(url, json=payload, timeout=18) as r:
+                    r.raise_for_status()
+                    j = await r.json()
+                out.append(j.get("translatedText") or t)
+            except Exception:
+                out.append(t)
 
-        try:
-            async with session.post(url, data=data, timeout=20) as r:
-                r.raise_for_status()
-                j = await r.json()
-            tr = j.get("translations") or []
-            out = []
-            for i in range(len(texts)):
-                out.append((tr[i].get("text") or texts[i]) if i < len(tr) else texts[i])
-            return out
-        except Exception:
-            return texts
+        return out, used
 
     async def fetch(self, session) -> Tuple[List[NewsItem], List[NewsItem], List[str], bool]:
+        """
+        Retorna:
+          pt_items (tradução do EN base)
+          en_items (base)
+          sources
+          translated_ok
+        """
         en_items = self._pick_news_en()
+
         sources = []
         for it in en_items:
             if it.source not in sources:
@@ -117,10 +133,7 @@ class NewsEngine:
         for it in en_items:
             blocks.append(f"{it.title} — {it.summary}" if it.summary else it.title)
 
-        key = (os.getenv("DEEPL_API_KEY") or "").strip()
-        translated_ok = bool(key)
-
-        pt_blocks = await self._deepl_translate_batch(session, blocks, target_lang="PT-BR")
+        pt_blocks, used = await self._libre_translate_batch(session, blocks, "en", "pt")
 
         pt_items: List[NewsItem] = []
         for i, it in enumerate(en_items):
@@ -137,7 +150,7 @@ class NewsEngine:
                 )
             )
 
-        return pt_items, en_items, sources, translated_ok
+        return pt_items, en_items, sources, used
 
     def mark_seen(self, en_items: List[NewsItem]):
         for it in en_items:
@@ -180,8 +193,8 @@ class NewsEngine:
 
             if not translated_ok:
                 e.add_field(
-                    name="⚠️ Tradução",
-                    value="DEEPL_API_KEY não configurada — PT exibindo o mesmo texto do EN.",
+                    name="ℹ️ Tradução",
+                    value="LIBRETRANSLATE_URL não configurada — PT exibindo o mesmo texto do EN.",
                     inline=False,
                 )
 
