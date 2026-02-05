@@ -1,46 +1,33 @@
-# main.py (FINAL - discord.py 2.3.x compatível)
+# main.py (Atlas Radar v3 - SPOT-only)
 import os
 import asyncio
 import contextlib
-import inspect
 import signal
 from datetime import datetime
 import aiohttp
 import discord
 import pytz
-import requests
 from discord.ext import tasks
 from discord import app_commands
 
 import config
-import market
-import news
-import telegram
-
-# ✅ Import signals.py (se existir). Não derruba o bot se não existir.
-try:
-    import signals  # precisa ter scan_and_post(client, force: bool)
-except Exception as e:
-    signals = None
-    print(f"⚠️ signals.py não carregou: {e}")
+from binance_spot import BinanceSpot
+from notifier import Notifier
+from radar import RadarEngine, BR_TZ
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = (os.getenv("GUILD_ID") or "").strip()
 SYNC_COMMANDS = (os.getenv("SYNC_COMMANDS") or "0").strip() == "1"
 
-BR_TZ = pytz.timezone("America/Sao_Paulo")
-
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# ✅ Canal único permitido para comandos
 ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
 
 # ─────────────────────────────
-# CommandTree com check global por canal (discord.py way ✅)
+# CommandTree com bloqueio de canal (discord.py compatível)
 # ─────────────────────────────
 async def _deny(interaction: discord.Interaction, msg: str):
-    """Responde ephemeral sem quebrar se já respondeu."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
@@ -51,477 +38,215 @@ async def _deny(interaction: discord.Interaction, msg: str):
 
 class AtlasTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Se não configurou CANAL_ADMIN, não trava tudo sem querer
         if ADMIN_CHANNEL_ID <= 0:
             return True
-
-        # Bloqueia DM
         if interaction.guild is None:
             await _deny(interaction, "⛔ Comandos disponíveis apenas no servidor.")
             return False
-
-        # Trava por canal
         if interaction.channel_id != ADMIN_CHANNEL_ID:
             await _deny(interaction, f"⛔ Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
             return False
-
         return True
 
 tree = AtlasTree(client)
 
-# Controle scheduler (para não disparar 2x no mesmo dia)
-ultima_manha = None
-ultima_tarde = None
-ultima_sinal_slot = None  # evita duplicar sinais no mesmo minuto-slot
-
-# Rompimento
-ULTIMO_PRECO = {}      # {ativo: preco}
-FALHAS_SEGUIDAS = {}   # {ativo: count}
-
-# Anti-overlap
-PUBLICACAO_LOCK = asyncio.Lock()
-SINAIS_LOCK = asyncio.Lock()
-
-# Concorrência p/ não travar event loop
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
-SEM = asyncio.Semaphore(MAX_CONCURRENCY)
-
-_SHUTTING_DOWN = False
-
-# Sessão HTTP compartilhada (CoinGecko/Yahoo/Telegram etc.)
 HTTP_SESSION: aiohttp.ClientSession | None = None
+radar_engine = RadarEngine()
+binance: BinanceSpot | None = None
+notifier: Notifier | None = None
+
+RADAR_LOCK = asyncio.Lock()
+last_slot = None
 
 
-# ─────────────────────────────
-# Helpers
-# ─────────────────────────────
-def _get_cfg(name: str, default=None):
-    return getattr(config, name, default)
-
-def _channel_id(name: str):
-    v = _get_cfg(name, 0)
-    try:
-        v = int(v)
-        return v if v > 0 else None
-    except Exception:
-        return None
-
-async def _maybe_await(x):
-    if inspect.isawaitable(x):
-        return await x
-    return x
-
-async def _call_sync_or_async(fn, *args, **kwargs):
-    if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-    return await asyncio.to_thread(lambda: fn(*args, **kwargs))
-
-
-# ─────────────────────────────
-# UTIL
-# ─────────────────────────────
-def emoji_var(v: float) -> str:
-    if v is None:
-        return "⏺️"
-    if v > 0:
-        return "🔼"
-    if v < 0:
-        return "🔽"
-    return "⏺️"
-
-def sentimento_geral(qtd_altas: int, qtd_quedas: int):
-    if qtd_altas > qtd_quedas:
-        return "😄 Mercado positivo", 0x2ECC71
-    if qtd_quedas > qtd_altas:
-        return "😨 Mercado defensivo", 0xE74C3C
-    return "😐 Mercado neutro", 0xF1C40F
-
-def texto_cenario(sent_label: str) -> str:
-    if "positivo" in sent_label:
-        return (
-            "🧭 **Cenário:** apetite por risco maior.\n"
-            "✅ Foque em qualidade e tendência.\n"
-            "⚠️ Cuidado com euforia / alavancagem."
-        )
-    if "defensivo" in sent_label:
-        return (
-            "🧭 **Cenário:** aversão a risco.\n"
-            "🛡️ Preserve capital e liquidez.\n"
-            "🎯 Entradas só com confirmação."
-        )
-    return (
-        "🧭 **Cenário:** mercado lateral/indefinido.\n"
-        "🎯 Seletividade e exposição menor.\n"
-        "⏳ Aguarde direção antes de aumentar mão."
-    )
-
-def ideias_em_baixa() -> str:
-    return (
-        "💡 **Dia de baixa (educacional):**\n"
-        "• Prefira qualidade + caixa forte\n"
-        "• ETFs amplos ajudam a diversificar\n"
-        "• Aportes em etapas (não tudo de uma vez)\n"
-        "• Evite decisões por impulso"
-    )
-
-async def log_bot(titulo: str, mensagem: str):
-    cid = _channel_id("CANAL_LOGS")
-    canal = client.get_channel(cid) if cid else None
-    if not canal:
+async def log(msg: str):
+    cid = int(getattr(config, "CANAL_LOGS", 0) or 0)
+    if not cid:
         return
-    embed = discord.Embed(title=f"📋 {titulo}", description=mensagem, color=0xE67E22)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M"))
-    await canal.send(embed=embed)
-
-def dolar_para_real_sync() -> float:
-    try:
-        r = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=BRL", timeout=10)
-        data = r.json()
-        rate = data.get("rates", {}).get("BRL")
-        return float(rate) if rate else 5.0
-    except Exception:
-        return 5.0
-
-
-# ─────────────────────────────
-# ALERTA URGENTE (ROMPIMENTO)
-# ─────────────────────────────
-async def alerta_rompimento(ativo: str, preco_atual: float, categoria: str):
-    cid = _channel_id("CANAL_NOTICIAS")
-    canal = client.get_channel(cid) if cid else None
-    if not canal:
-        return
-
-    preco_antigo = ULTIMO_PRECO.get(ativo)
-    ULTIMO_PRECO[ativo] = preco_atual
-
-    if preco_antigo is None or preco_antigo <= 0:
-        return
-
-    limite = float(_get_cfg("LIMITE_ROMPIMENTO_PCT", 2.0))
-    var = ((preco_atual - preco_antigo) / preco_antigo) * 100.0
-    if abs(var) < limite:
-        return
-
-    direcao = "🚨🔼 ROMPIMENTO DE ALTA" if var > 0 else "🚨🔽 ROMPIMENTO DE BAIXA"
-    cor = 0x2ECC71 if var > 0 else 0xE74C3C
-
-    embed = discord.Embed(
-        title=direcao,
-        description=f"🧷 **Ativo:** `{ativo}`\n🏷️ **Categoria:** {categoria}",
-        color=cor
-    )
-    embed.add_field(name="Preço anterior", value=f"{preco_antigo:,.4f}", inline=True)
-    embed.add_field(name="Preço atual", value=f"{preco_atual:,.4f}", inline=True)
-    embed.add_field(name="Movimento", value=f"{var:+.2f}% {emoji_var(var)}", inline=False)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
-
-    await canal.send(embed=embed)
-
-
-# ─────────────────────────────
-# COLETA (não bloqueia event loop)
-# ─────────────────────────────
-async def _fetch_one(categoria: str, ativo: str):
-    async with SEM:
+    ch = client.get_channel(cid)
+    if ch is None:
         try:
-            p, v = await _call_sync_or_async(market.dados_ativo, ativo)
-
-            # FIIs: se preço não veio, ignora sem log
-            if ativo.endswith("11.SA") and p is None:
-                return None
-
-            if p is None or v is None:
-                FALHAS_SEGUIDAS[ativo] = FALHAS_SEGUIDAS.get(ativo, 0) + 1
-                if FALHAS_SEGUIDAS[ativo] >= 3:
-                    await log_bot("Ativo sem dados", f"{ativo} ({categoria})")
-                    FALHAS_SEGUIDAS[ativo] = 0
-                return None
-
-            FALHAS_SEGUIDAS[ativo] = 0
-            await alerta_rompimento(ativo, float(p), categoria)
-            return (ativo, float(p), float(v))
-
-        except Exception as e:
-            await log_bot("Erro ao buscar ativo", f"{ativo} ({categoria})\n{e}")
-            return None
-
-async def coletar_dados():
-    coros = []
-    order = []
-    for categoria, ativos in config.ATIVOS.items():
-        for ativo in ativos:
-            coros.append(_fetch_one(categoria, ativo))
-            order.append((categoria, ativo))
-
-    results = await asyncio.gather(*coros, return_exceptions=False)
-
-    dados = {}
-    total = 0
-    for (categoria, _), item in zip(order, results):
-        if not item:
-            continue
-        dados.setdefault(categoria, []).append(item)
-        total += 1
-
-    if total == 0:
-        await log_bot("Relatório cancelado", "Nenhum ativo retornou dados válidos.")
-        return {}
-    return dados
-
-
-# ─────────────────────────────
-# EMBEDS
-# ─────────────────────────────
-def embed_relatorio(dados: dict, cot: float):
-    moves = [(a, p, v) for itens in dados.values() for (a, p, v) in itens]
-
-    altas = sum(1 for _, _, v in moves if v > 0)
-    quedas = sum(1 for _, _, v in moves if v < 0)
-    sent_label, cor = sentimento_geral(altas, quedas)
-
-    top_alta = sorted(moves, key=lambda x: x[2], reverse=True)[:3]
-    top_baixa = sorted(moves, key=lambda x: x[2])[:3]
-
-    embed = discord.Embed(
-        title="📊 Relatório Completo do Mercado",
-        description=f"**{sent_label}**\n\n{texto_cenario(sent_label)}",
-        color=cor
-    )
-
-    embed.add_field(
-        name="🔝 Top 3 Altas",
-        value="\n".join([f"• `{a}` {emoji_var(v)} **{v:.2f}%**" for a, _, v in top_alta]) or "—",
-        inline=False
-    )
-    embed.add_field(
-        name="🔻 Top 3 Quedas",
-        value="\n".join([f"• `{a}` {emoji_var(v)} **{v:.2f}%**" for a, _, v in top_baixa]) or "—",
-        inline=False
-    )
-
-    for categoria, itens in dados.items():
-        linhas = [
-            f"• `{ativo}` {emoji_var(var)} **{var:.2f}%**  |  💲 {preco:,.2f}  |  🇧🇷 R$ {(preco*cot):,.2f}"
-            for (ativo, preco, var) in itens
-        ]
-        embed.add_field(name=categoria, value="\n".join(linhas), inline=False)
-
-    embed.add_field(name="💡 Dica do dia", value=ideias_em_baixa(), inline=False)
-    embed.set_footer(text=datetime.now(BR_TZ).strftime("Atualizado %d/%m/%Y %H:%M"))
-    return embed
-
-def embed_jornal(manchetes: list[str], periodo: str):
-    embed = discord.Embed(
-        title=f"🗞️ Jornal do Mercado — {periodo}",
-        description="🌍 Manchetes e impacto no mercado 😄",
-        color=0x00BFFF
-    )
-
-    if not manchetes:
-        embed.add_field(
-            name="⚠️ Sem manchetes agora",
-            value="O RSS retornou vazio. Tentaremos novamente no próximo ciclo.",
-            inline=False
-        )
-        embed.set_footer(text="Fonte: Google News RSS")
-        return embed
-
-    bloco1 = "\n".join([f"📰 **{i}.** {m}" for i, m in enumerate(manchetes[:5], start=1)])
-    bloco2 = "\n".join([f"🗞️ **{i}.** {m}" for i, m in enumerate(manchetes[5:10], start=6)])
-
-    embed.add_field(name="🔥 Manchetes principais", value=bloco1, inline=False)
-    if bloco2.strip():
-        embed.add_field(name="📌 Mais notícias", value=bloco2, inline=False)
-
-    embed.add_field(
-        name="🧠 Leitura rápida",
-        value="• Cenário macro (juros, inflação, dólar)\n• Gestão de risco sempre ✅",
-        inline=False
-    )
-    embed.set_footer(text="Fonte: Google News RSS")
-    return embed
-
-
-# ─────────────────────────────
-# PUBLICAÇÕES
-# ─────────────────────────────
-async def enviar_publicacoes(periodo: str, *, enviar_tg=True):
-    if PUBLICACAO_LOCK.locked():
-        await log_bot("Scheduler", "Ignorado: execução já em andamento (anti-overlap).")
-        return
-
-    async with PUBLICACAO_LOCK:
-        dados = await coletar_dados()
-        if not dados:
+            ch = await client.fetch_channel(cid)
+        except Exception:
             return
-
-        cot = await asyncio.to_thread(dolar_para_real_sync)
-        manchetes = await _call_sync_or_async(news.noticias) if hasattr(news, "noticias") else []
-
-        canal_rel = client.get_channel(_channel_id("CANAL_ANALISE") or 0)
-        canal_j = client.get_channel(_channel_id("CANAL_NOTICIAS") or 0)
-
-        if canal_rel:
-            await canal_rel.send(embed=embed_relatorio(dados, cot))
-        else:
-            await log_bot("CANAL_ANALISE inválido", "Não encontrei canal de análise.")
-
-        if canal_j and _get_cfg("NEWS_ATIVAS", True):
-            await canal_j.send(embed=embed_jornal(manchetes, periodo))
-        else:
-            await log_bot("CANAL_NOTICIAS inválido", "Não encontrei canal de notícias ou NEWS_ATIVAS desativada.")
-
-        if enviar_tg and hasattr(telegram, "enviar_telegram"):
-            ok = await _maybe_await(telegram.enviar_telegram(f"📌 Atlas Finance — {periodo}"))
-            if ok is False:
-                await log_bot("Telegram", "Falha ao enviar (token/chat_id).")
+    with contextlib.suppress(Exception):
+        await ch.send(f"📡 {msg}")
 
 
-# ─────────────────────────────
-# SINAIS
-# ─────────────────────────────
-async def _run_signals_now():
-    if signals is None:
-        return False, "signals.py não está disponível."
-    if not hasattr(signals, "scan_and_post"):
-        return False, "signals.py não tem scan_and_post(client, force)."
-    try:
-        await _call_sync_or_async(signals.scan_and_post, client, True)  # force=True
-        return True, "Scan de sinais executado (manual)."
-    except Exception as e:
-        return False, f"Falha ao executar scan_and_post(): {e}"
+def _time_hhmm(now: datetime) -> str:
+    return now.strftime("%H:%M")
 
 
-# ─────────────────────────────
-# SLASH COMMANDS
-# ─────────────────────────────
-@tree.command(name="testetudo", description="Testa publicações oficiais (Relatório + Jornal + Telegram) (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_testetudo(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    await enviar_publicacoes("Teste Tudo (manual)", enviar_tg=True)
-    await interaction.followup.send("✅ Disparei as publicações.", ephemeral=True)
-
-@tree.command(name="reiniciar", description="Reinicia o bot (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_reiniciar(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Reiniciando...", ephemeral=True)
-    await asyncio.sleep(1)
-    await shutdown("manual restart")
-
-@tree.command(name="sinaisagora", description="Força um scan/post de sinais agora (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_sinaisagora(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    if SINAIS_LOCK.locked():
-        await interaction.followup.send("⏳ Já tem um scan em andamento.", ephemeral=True)
+@tasks.loop(seconds=10)
+async def radar_loop():
+    """
+    Scaneia a cada minuto (sem drift) e dispara alertas relevantes.
+    """
+    global last_slot
+    if notifier is None or binance is None:
         return
-    async with SINAIS_LOCK:
-        ok, msg = await _run_signals_now()
-        await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
+    if not getattr(config, "RADAR_ENABLED", False):
+        return
 
-@tree.command(name="sinaisstatus", description="Mostra status dos sinais (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_sinaisstatus(interaction: discord.Interaction):
-    msg = (
-        f"**signals.py:** `{'OK' if signals is not None else 'INDISPONÍVEL'}`\n"
-        f"**SINAIS_ATIVOS (config):** `{_get_cfg('SINAIS_ATIVOS', False)}`\n"
-        f"**SINAIS_TIMEFRAME:** `{_get_cfg('SINAIS_TIMEFRAME', '15m')}`\n"
-        f"**SINAIS_EXCHANGES:** `{_get_cfg('SINAIS_EXCHANGES', [])}`\n"
-        f"**CANAL_SINAIS_SPOT:** `{_channel_id('CANAL_SINAIS_SPOT')}`\n"
-        f"**CANAL_SINAIS_FUTURES:** `{_channel_id('CANAL_SINAIS_FUTURES')}`"
+    now = datetime.now(BR_TZ)
+
+    # roda somente no segundo 0-9 e trava o slot por minuto
+    if now.second > 9:
+        return
+
+    slot = now.strftime("%Y-%m-%d %H:%M")
+    if last_slot == slot:
+        return
+
+    if RADAR_LOCK.locked():
+        return
+
+    async with RADAR_LOCK:
+        sent, candidates = await radar_engine.run_cycle(binance, notifier, force=False)
+        await log(f"Radar ciclo {slot}: candidatos={candidates} enviados={sent}")
+
+    last_slot = slot
+
+
+@tasks.loop(seconds=20)
+async def pulse_loop():
+    """
+    “Pulso” profissional em horários fixos (BRT).
+    """
+    if notifier is None:
+        return
+    if not getattr(config, "PULSE_ENABLED", True):
+        return
+
+    now = datetime.now(BR_TZ)
+    hhmm = _time_hhmm(now)
+    times = set(getattr(config, "PULSE_TIMES_BRT", []))
+
+    if hhmm not in times:
+        return
+
+    # evita duplicar no mesmo minuto
+    key = now.strftime("%Y-%m-%d %H:%M")
+    if getattr(pulse_loop, "_last", None) == key:
+        return
+    pulse_loop._last = key  # type: ignore
+
+    emb = discord.Embed(
+        title="🧠 Atlas Radar — Pulso do Mercado (SPOT)",
+        description=(
+            "📌 **Objetivo:** manter a galera antenada e disciplinada.\n\n"
+            "✅ **O que fazer com o dinheiro (playbook):**\n"
+            "• Se você investe: priorize **plano + DCA + diversificação**, evite FOMO.\n"
+            "• Se você faz trades: opere só com **setup**, **stop** e risco pequeno.\n"
+            "• Tenha caixa e regra: **não aumentar mão em emoção**.\n\n"
+            "⚠️ Educacional — não é recomendação financeira."
+        ),
+        color=0x3498DB,
     )
-    await interaction.response.send_message(msg, ephemeral=True)
+    emb.set_footer(text=f"{now.strftime('%d/%m/%Y %H:%M')} BRT")
+    await notifier.send_discord_pulse(emb)
+    await notifier.send_telegram(
+        f"🧠 Atlas Radar — Pulso (SPOT)\n"
+        f"Playbook:\n"
+        f"- Investidor: DCA + diversificação, evite FOMO\n"
+        f"- Trader: setup + stop + risco pequeno\n"
+        f"- Disciplina > emoção\n\n"
+        f"Educacional — não é recomendação financeira."
+    )
 
+
+# ─────────────────────────────
+# Slash commands (admin)
+# ─────────────────────────────
+@tree.command(name="radar_status", description="Status do Atlas Radar (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def radar_status(interaction: discord.Interaction):
+    paused = radar_engine.paused()
+    await interaction.response.send_message(
+        f"📡 **Atlas Radar v3**\n"
+        f"RADAR_ENABLED: `{getattr(config, 'RADAR_ENABLED', False)}`\n"
+        f"Paused: `{paused}`\n"
+        f"Watchlist: `{len(getattr(config, 'WATCHLIST', []))}` ativos\n"
+        f"Scan: `{getattr(config, 'SCAN_EVERY_SECONDS', 60)}s` (motor roda por minuto)\n",
+        ephemeral=True,
+    )
+
+@tree.command(name="radar_agora", description="Força um ciclo de radar agora (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def radar_agora(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if notifier is None or binance is None:
+        await interaction.followup.send("❌ Radar não inicializado.", ephemeral=True)
+        return
+    if RADAR_LOCK.locked():
+        await interaction.followup.send("⏳ Já existe um ciclo em execução.", ephemeral=True)
+        return
+    async with RADAR_LOCK:
+        sent, candidates = await radar_engine.run_cycle(binance, notifier, force=True)
+    await interaction.followup.send(f"✅ Forçado: candidatos={candidates} enviados={sent}", ephemeral=True)
+
+@tree.command(name="radar_pause", description="Pausa alertas por X minutos (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def radar_pause(interaction: discord.Interaction, minutos: int):
+    radar_engine.pause_minutes(max(1, min(1440, int(minutos))))
+    await interaction.response.send_message(f"⏸️ Alertas pausados por {minutos} minutos.", ephemeral=True)
+
+@tree.command(name="radar_resume", description="Retoma alertas (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def radar_resume(interaction: discord.Interaction):
+    radar_engine.resume()
+    await interaction.response.send_message("▶️ Alertas retomados.", ephemeral=True)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ Você não tem permissão para usar este comando."
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
+        await _deny(interaction, "❌ Você não tem permissão para usar este comando.")
         return
-
-    with contextlib.suppress(Exception):
-        await log_bot("Erro em slash command", str(error))
+    # erros gerais
+    await log(f"Erro slash: {error}")
 
 
 # ─────────────────────────────
-# SCHEDULERS
+# Ready + sync
 # ─────────────────────────────
-@tasks.loop(minutes=1)
-async def scheduler():
-    global ultima_manha, ultima_tarde
-    agora = datetime.now(BR_TZ)
-    hhmm = agora.strftime("%H:%M")
+@client.event
+async def on_ready():
+    await log(f"Conectado como {client.user}")
 
-    if hhmm == "06:00" and ultima_manha != agora.date():
-        await enviar_publicacoes("Abertura (06:00)", enviar_tg=True)
-        ultima_manha = agora.date()
-
-    if hhmm == "18:00" and ultima_tarde != agora.date():
-        await enviar_publicacoes("Fechamento (18:00)", enviar_tg=True)
-        ultima_tarde = agora.date()
-
-
-@tasks.loop(minutes=1)
-async def signals_scheduler():
-    global ultima_sinal_slot
-
-    if signals is None:
-        return
-    if not _get_cfg("SINAIS_ATIVOS", False):
-        return
-    if not hasattr(signals, "scan_and_post"):
-        return
-
-    agora = datetime.now(BR_TZ)
-
-    # somente nos minutos 00/15/30/45
-    if agora.minute % 15 != 0:
-        return
-
-    slot_key = agora.strftime("%Y-%m-%d %H:%M")
-    if ultima_sinal_slot == slot_key:
-        return
-
-    if SINAIS_LOCK.locked():
-        return
-
-    async with SINAIS_LOCK:
+    if SYNC_COMMANDS:
         try:
-            await _call_sync_or_async(signals.scan_and_post, client, False)  # force=False
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                tree.copy_global_to(guild=guild)
+                synced = await tree.sync(guild=guild)
+                await log(f"Sync guild OK: {[c.name for c in synced]}")
+            else:
+                synced = await tree.sync()
+                await log(f"Sync global OK: {[c.name for c in synced]}")
         except Exception as e:
-            await log_bot("SignalsScheduler", f"Erro: {e}")
+            await log(f"Falha sync: {e}")
 
-    ultima_sinal_slot = slot_key
+    if not radar_loop.is_running():
+        radar_loop.start()
+    if not pulse_loop.is_running():
+        pulse_loop.start()
 
 
 # ─────────────────────────────
-# SHUTDOWN / SIGNALS
+# Shutdown robusto
 # ─────────────────────────────
 async def shutdown(reason: str):
-    global _SHUTTING_DOWN
-    if _SHUTTING_DOWN:
-        return
-    _SHUTTING_DOWN = True
-
+    await log(f"Shutdown: {reason}")
     with contextlib.suppress(Exception):
-        if scheduler.is_running():
-            scheduler.cancel()
+        if radar_loop.is_running():
+            radar_loop.cancel()
     with contextlib.suppress(Exception):
-        if signals_scheduler.is_running():
-            signals_scheduler.cancel()
-
-    with contextlib.suppress(Exception):
-        await log_bot("Shutdown", f"Encerrando... motivo: {reason}")
+        if pulse_loop.is_running():
+            pulse_loop.cancel()
 
     global HTTP_SESSION
     with contextlib.suppress(Exception):
-        if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+        if HTTP_SESSION and not HTTP_SESSION.closed:
             await HTTP_SESSION.close()
 
     with contextlib.suppress(Exception):
@@ -538,36 +263,7 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 
 # ─────────────────────────────
-# READY + SYNC
-# ─────────────────────────────
-@client.event
-async def on_ready():
-    print(f"🤖 Conectado como {client.user}")
-    local_names = [c.name for c in tree.get_commands()]
-    print("COMANDOS REGISTRADOS (local):", local_names)
-
-    if SYNC_COMMANDS:
-        try:
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                tree.copy_global_to(guild=guild)
-                synced = await tree.sync(guild=guild)
-                print(f"✅ Sync GUILD OK ({GUILD_ID}). Publicados:", [c.name for c in synced])
-            else:
-                synced = await tree.sync()
-                print("✅ Sync GLOBAL OK. Publicados:", [c.name for c in synced])
-        except Exception as e:
-            print(f"⚠️ Falha ao sincronizar slash commands: {e}")
-
-    if not scheduler.is_running():
-        scheduler.start()
-
-    if not signals_scheduler.is_running():
-        signals_scheduler.start()
-
-
-# ─────────────────────────────
-# ENTRYPOINT ROBUSTO
+# Entrypoint
 # ─────────────────────────────
 async def main():
     if not TOKEN:
@@ -576,22 +272,23 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    global HTTP_SESSION
+    global HTTP_SESSION, binance, notifier
     timeout = aiohttp.ClientTimeout(total=20)
     connector = aiohttp.TCPConnector(limit=50)
     HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-    market.set_session(HTTP_SESSION)
-    news.set_session(HTTP_SESSION)
-    telegram.set_session(HTTP_SESSION)
+    binance = BinanceSpot(HTTP_SESSION)
+    notifier = Notifier(
+        client=client,
+        session=HTTP_SESSION,
+        telegram_enabled=bool(getattr(config, "TELEGRAM_ENABLED", True)),
+        discord_alerts_channel_id=int(getattr(config, "CANAL_ALERTAS", 0) or 0),
+        discord_pulse_channel_id=int(getattr(config, "CANAL_PULSO", 0) or 0),
+        role_ping_id=int(getattr(config, "ROLE_PING_ID", 0) or 0),
+    )
 
     async with client:
-        try:
-            await client.start(TOKEN)
-        finally:
-            with contextlib.suppress(Exception):
-                if HTTP_SESSION is not None and not HTTP_SESSION.closed:
-                    await HTTP_SESSION.close()
+        await client.start(TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
