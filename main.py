@@ -48,6 +48,7 @@ class AtlasClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = AtlasTree(self)
 
+
 class AtlasTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if ADMIN_CHANNEL_ID <= 0:
@@ -73,6 +74,10 @@ class AtlasTree(app_commands.CommandTree):
 client = AtlasClient()
 
 
+def _now_brt() -> datetime:
+    return datetime.now(BR_TZ)
+
+
 async def log(msg: str):
     cid = int(getattr(config, "CANAL_LOGS", 0) or 0)
     if not cid:
@@ -87,20 +92,29 @@ async def log(msg: str):
         await ch.send(f"📡 {msg}")
 
 
-def _now_brt():
-    return datetime.now(BR_TZ)
-
 def _should_run_member(now: datetime) -> bool:
     hhmm = now.strftime("%H:%M")
     return hhmm in set(getattr(config, "MEMBRO_TIMES", []))
+
 
 def _should_run_invest(now: datetime) -> bool:
     every = int(getattr(config, "INVESTIDOR_EVERY_MINUTES", 12))
     return (now.minute % every) == 0
 
+
 def _should_run_news(now: datetime) -> bool:
     every = int(getattr(config, "NEWS_EVERY_MINUTES", 30))
     return (now.minute % every) == 0
+
+
+def _test_embed(title: str, note: str) -> discord.Embed:
+    now = _now_brt().strftime("%d/%m/%Y %H:%M")
+    e = discord.Embed(
+        title=f"✅ TESTE — {title}",
+        description=f"{note}\n\n🕒 {now} BRT",
+        color=0x2ECC71,
+    )
+    return e
 
 
 async def sync_commands():
@@ -117,6 +131,19 @@ async def sync_commands():
         await log(f"Falha SYNC: {e}")
 
 
+async def _send_or_fail(channel_id: int, embed: discord.Embed, role_ping: int = 0, tag: str = "") -> tuple[bool, str]:
+    if not channel_id or int(channel_id) <= 0:
+        return False, f"{tag} canal_id=0"
+    try:
+        await notifier.send_discord(int(channel_id), embed, role_ping_id=int(role_ping or 0))
+        return True, ""
+    except Exception as e:
+        return False, f"{tag} {e}"
+
+
+# ─────────────────────────────
+# LOOPS AUTOMÁTICOS (1x/min)
+# ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_member():
     global _last_member_minute
@@ -136,17 +163,22 @@ async def loop_member():
     _last_member_minute = minute_key
 
     async with LOCK:
+        # BINANCE MEMBRO
         dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
         emb = engine_binance.build_embed(dips, tier="membro")
-        await notifier.send_discord(int(config.CANAL_BINANCE_MEMBRO), emb, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
+        ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "BINANCE_MEMBRO")
+        if not ok:
+            await log(f"Falha envio BINANCE_MEMBRO: {err}")
 
-        # Binomo membro: se não tiver entrada, não manda (reduz spam)
+        # BINOMO MEMBRO (15m) — se não gerar, não manda (pra manter 4/dia)
         entries = []
         e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
         if e15:
             entries.append(e15)
             emb2 = engine_binomo.build_embed(entries, tier="membro")
-            await notifier.send_discord(int(config.CANAL_BINOMO_MEMBRO), emb2, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
+            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_MEMBRO), emb2, int(config.ROLE_MEMBRO_ID or 0), "BINOMO_MEMBRO")
+            if not ok2:
+                await log(f"Falha envio BINOMO_MEMBRO: {err2}")
         else:
             await log("MEMBRO BINOMO: sem entrada (ou mercado fechado).")
 
@@ -177,11 +209,14 @@ async def loop_investidor():
     _last_invest_minute = minute_key
 
     async with LOCK:
+        # BINANCE INVESTIDOR
         dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
         emb = engine_binance.build_embed(dips, tier="investidor")
-        await notifier.send_discord(int(config.CANAL_BINANCE_INVESTIDOR), emb, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
+        ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV")
+        if not ok:
+            await log(f"Falha envio BINANCE_INV: {err}")
 
-        # Binomo investidor: tenta 1m/5m/15m — se não achar, loga e segue.
+        # BINOMO INVESTIDOR (1m/5m/15m)
         entries = []
         for tf in ("1m", "5m", "15m"):
             e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
@@ -190,9 +225,15 @@ async def loop_investidor():
 
         if entries:
             emb2 = engine_binomo.build_embed(entries, tier="investidor")
-            await notifier.send_discord(int(config.CANAL_BINOMO_INVESTIDOR), emb2, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
+            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb2, int(config.ROLE_INVESTIDOR_ID or 0), "BINOMO_INV")
+            if not ok2:
+                await log(f"Falha envio BINOMO_INV: {err2}")
         else:
-            await log("INV BINOMO: sem entradas válidas (ou mercado fechado).")
+            # “bolsa fechada”: fim de semana → loga e não manda
+            if datetime.utcnow().weekday() >= 5:
+                await log("INV BINOMO: mercado fechado (fim de semana). Sem envio.")
+            else:
+                await log("INV BINOMO: sem entradas válidas.")
 
         await log(f"INV OK {minute_key}")
 
@@ -219,11 +260,15 @@ async def loop_news():
 
     _last_news_minute = minute_key
 
+    # news_engine final retorna (pt, en)
     pt, en = engine_news.fetch()
     engine_news.mark_seen(pt + en)
-
     emb = engine_news.build_embed(pt, en)
-    await notifier.send_discord(int(config.CANAL_NEWS_CRIPTO), emb)
+
+    ok, err = await _send_or_fail(int(config.CANAL_NEWS_CRIPTO), emb, 0, "NEWS")
+    if not ok:
+        await log(f"Falha envio NEWS: {err}")
+
     await log(f"NEWS OK {minute_key} pt={len(pt)} en={len(en)}")
 
 
@@ -232,15 +277,21 @@ async def loop_news_error(err: Exception):
     await log(f"ERRO loop_news: {err}")
 
 
-# ── COMANDOS
+# ─────────────────────────────
+# COMANDOS (ADMIN)
+# ─────────────────────────────
 @client.tree.command(name="status", description="Status do Atlas (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
-        f"✅ Online\nGUILD_ID={GUILD_ID or 'GLOBAL'}\n"
-        f"BINANCE_INV={config.CANAL_BINANCE_INVESTIDOR}\nBINOMO_INV={config.CANAL_BINOMO_INVESTIDOR}\nNEWS={config.CANAL_NEWS_CRIPTO}\nLOGS={config.CANAL_LOGS}",
+        f"✅ Online\nGUILD={GUILD_ID or 'GLOBAL'}\n"
+        f"BINANCE_MEMBRO={config.CANAL_BINANCE_MEMBRO}\nBINANCE_INV={config.CANAL_BINANCE_INVESTIDOR}\n"
+        f"BINOMO_MEMBRO={config.CANAL_BINOMO_MEMBRO}\nBINOMO_INV={config.CANAL_BINOMO_INVESTIDOR}\n"
+        f"NEWS={config.CANAL_NEWS_CRIPTO}\nLOGS={config.CANAL_LOGS}\n"
+        f"INVESTIDOR_EVERY_MINUTES={getattr(config,'INVESTIDOR_EVERY_MINUTES',None)}\nMEMBRO_TIMES={getattr(config,'MEMBRO_TIMES',None)}",
         ephemeral=True,
     )
+
 
 @client.tree.command(name="resync", description="Re-sincroniza comandos (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
@@ -249,18 +300,160 @@ async def resync(interaction: discord.Interaction):
     await sync_commands()
     await interaction.followup.send("✅ Sync solicitado. Veja o CANAL_LOGS.", ephemeral=True)
 
-@client.tree.command(name="force_investidor", description="Força ciclo investidor agora (Admin)")
+
+@client.tree.command(name="force_investidor", description="Força envio INVESTIDOR (Binance+Binomo) (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def force_investidor(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    now = _now_brt().strftime("%Y-%m-%d %H:%M")
-    await log(f"FORCE_INV {now} por {interaction.user}")
-    # executa uma vez
+    if notifier is None or binance is None or yahoo is None:
+        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
+        return
+
+    results = []
+    fails = []
+
     async with LOCK:
-        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-        emb = engine_binance.build_embed(dips, tier="investidor")
-        await notifier.send_discord(int(config.CANAL_BINANCE_INVESTIDOR), emb, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
-    await interaction.followup.send("✅ Enviado Binance Investidor.", ephemeral=True)
+        # Binance investidor sempre envia (mesmo sem dips)
+        try:
+            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(dips, tier="investidor")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV_FORCE")
+            if ok:
+                results.append("✅ Binance INVESTIDOR")
+            else:
+                fails.append(f"❌ Binance INVESTIDOR ({err})")
+        except Exception as e:
+            fails.append(f"❌ Binance INVESTIDOR ({e})")
+
+        # Binomo investidor — se não gerar, manda embed TESTE (pra validar canal)
+        try:
+            entries = []
+            for tf in ("1m", "5m", "15m"):
+                e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
+                if e:
+                    entries.append(e)
+
+            if entries:
+                emb2 = engine_binomo.build_embed(entries, tier="investidor")
+            else:
+                emb2 = _test_embed("Binomo INVESTIDOR", "Sem entrada no momento — este embed confirma que o canal está OK ✅")
+
+            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb2, int(config.ROLE_INVESTIDOR_ID or 0), "BINOMO_INV_FORCE")
+            if ok2:
+                results.append("✅ Binomo INVESTIDOR")
+            else:
+                fails.append(f"❌ Binomo INVESTIDOR ({err2})")
+        except Exception as e:
+            fails.append(f"❌ Binomo INVESTIDOR ({e})")
+
+    await log(f"FORCE_INVESTIDOR por {interaction.user} -> {results} / {fails}")
+    msg = "\n".join(results + ([""] + fails if fails else []))
+    await interaction.followup.send("📨 **Force Investidor concluído:**\n" + msg, ephemeral=True)
+
+
+@client.tree.command(name="force_all", description="Força envio em TODOS os canais (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def force_all(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if notifier is None or binance is None or yahoo is None:
+        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
+        return
+
+    results = []
+    fails = []
+
+    async with LOCK:
+        # ── BINANCE MEMBRO
+        try:
+            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(dips, tier="membro")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "BINANCE_MEMBRO_FORCE")
+            if ok: results.append("✅ Binance MEMBRO")
+            else:  fails.append(f"❌ Binance MEMBRO ({err})")
+        except Exception as e:
+            fails.append(f"❌ Binance MEMBRO ({e})")
+
+        # ── BINANCE INVESTIDOR
+        try:
+            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(dips, tier="investidor")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV_FORCEALL")
+            if ok: results.append("✅ Binance INVESTIDOR")
+            else:  fails.append(f"❌ Binance INVESTIDOR ({err})")
+        except Exception as e:
+            fails.append(f"❌ Binance INVESTIDOR ({e})")
+
+        # ── BINOMO MEMBRO (se não gerar, manda teste)
+        try:
+            entries = []
+            e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
+            if e15:
+                entries.append(e15)
+
+            emb2 = engine_binomo.build_embed(entries, tier="membro") if entries else _test_embed(
+                "Binomo MEMBRO",
+                "Sem entrada no momento — este embed confirma que o canal está OK ✅"
+            )
+
+            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_MEMBRO), emb2, int(config.ROLE_MEMBRO_ID or 0), "BINOMO_MEMBRO_FORCE")
+            if ok2: results.append("✅ Binomo MEMBRO")
+            else:  fails.append(f"❌ Binomo MEMBRO ({err2})")
+        except Exception as e:
+            fails.append(f"❌ Binomo MEMBRO ({e})")
+
+        # ── BINOMO INVESTIDOR (se não gerar, manda teste)
+        try:
+            entries = []
+            for tf in ("1m", "5m", "15m"):
+                e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
+                if e:
+                    entries.append(e)
+
+            emb3 = engine_binomo.build_embed(entries, tier="investidor") if entries else _test_embed(
+                "Binomo INVESTIDOR",
+                "Sem entrada no momento — este embed confirma que o canal está OK ✅"
+            )
+
+            ok3, err3 = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb3, int(config.ROLE_INVESTIDOR_ID or 0), "BINOMO_INV_FORCEALL")
+            if ok3: results.append("✅ Binomo INVESTIDOR")
+            else:  fails.append(f"❌ Binomo INVESTIDOR ({err3})")
+        except Exception as e:
+            fails.append(f"❌ Binomo INVESTIDOR ({e})")
+
+        # ── NEWS (se não tiver item, manda “teste ok” também)
+        try:
+            pt, en = engine_news.fetch()
+            engine_news.mark_seen(pt + en)
+
+            embn = engine_news.build_embed(pt, en) if (pt or en) else _test_embed(
+                "NEWS",
+                "Sem notícias novas agora — este embed confirma que o canal NEWS está OK ✅"
+            )
+
+            okn, errn = await _send_or_fail(int(config.CANAL_NEWS_CRIPTO), embn, 0, "NEWS_FORCEALL")
+            if okn: results.append("✅ NEWS")
+            else:   fails.append(f"❌ NEWS ({errn})")
+        except Exception as e:
+            fails.append(f"❌ NEWS ({e})")
+
+    await log(f"FORCE_ALL por {interaction.user} -> {results} / {fails}")
+    msg = "\n".join(results + ([""] + fails if fails else []))
+    await interaction.followup.send("📨 **Force All concluído:**\n" + msg, ephemeral=True)
+
+
+@client.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ Sem permissão.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Sem permissão.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    await log(f"Erro slash: {error}")
+
 
 @client.event
 async def on_ready():
@@ -281,10 +474,14 @@ async def on_ready():
 
 async def shutdown(reason: str):
     await log(f"Shutdown: {reason}")
+
     with contextlib.suppress(Exception):
-        if loop_member.is_running(): loop_member.cancel()
-        if loop_investidor.is_running(): loop_investidor.cancel()
-        if loop_news.is_running(): loop_news.cancel()
+        if loop_member.is_running():
+            loop_member.cancel()
+        if loop_investidor.is_running():
+            loop_investidor.cancel()
+        if loop_news.is_running():
+            loop_news.cancel()
 
     global HTTP
     with contextlib.suppress(Exception):
@@ -323,6 +520,7 @@ async def main():
 
     async with client:
         await client.start(TOKEN)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
