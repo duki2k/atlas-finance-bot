@@ -9,6 +9,7 @@ import config
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
+
 @dataclass
 class Signal:
     tier: str               # "membro" | "investidor"
@@ -32,6 +33,7 @@ class Signal:
     next_time_str: str
     next_minute: int
 
+
 def ema(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
         return None
@@ -41,18 +43,22 @@ def ema(values: List[float], period: int) -> Optional[float]:
         e = v * k + e * (1 - k)
     return e
 
+
 def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
     n = min(len(highs), len(lows), len(closes))
     if n < period + 2:
         return None
     trs = []
     for i in range(1, n):
-        h = highs[i]; l = lows[i]; pc = closes[i - 1]
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
     if len(trs) < period:
         return None
     return sum(trs[-period:]) / period
+
 
 def _fmt_price(p: float) -> str:
     if p >= 1000:
@@ -61,11 +67,13 @@ def _fmt_price(p: float) -> str:
         return f"{p:,.4f}"
     return f"{p:,.6f}"
 
+
 def _next_slot(now: datetime, interval: str) -> Tuple[datetime, int]:
     now = now.replace(second=0, microsecond=0)
     if interval == "1m":
         nxt = now + timedelta(minutes=1)
         return nxt, nxt.minute
+
     if interval == "5m":
         m = now.minute
         nm = ((m // 5) + 1) * 5
@@ -74,6 +82,7 @@ def _next_slot(now: datetime, interval: str) -> Tuple[datetime, int]:
             return nxt, 0
         nxt = now.replace(minute=nm)
         return nxt, nm
+
     if interval == "15m":
         m = now.minute
         nm = ((m // 15) + 1) * 15
@@ -82,13 +91,16 @@ def _next_slot(now: datetime, interval: str) -> Tuple[datetime, int]:
             return nxt, 0
         nxt = now.replace(minute=nm)
         return nxt, nm
+
     # 4h
     nxt = now + timedelta(hours=4)
     nxt = nxt.replace(minute=0)
     return nxt, 0
 
+
 def _cooldown_minutes(tier: str, interval: str, kind: str) -> int:
     return int(config.COOLDOWN_MINUTES.get((tier, interval, kind), 30))
+
 
 class RadarEngine:
     def __init__(self):
@@ -141,35 +153,52 @@ class RadarEngine:
             s += min(vol_mult, 3.0) * 10.0
         return s
 
+    # ✅ FINAL: embed com setas (INVESTIDOR + MEMBRO)
     def build_embed(self, s: Signal) -> discord.Embed:
+        up = "⬆️"
+        down = "⬇️"
+        arrow = up if s.side == "COMPRA" else down
+
         color = 0x2ECC71 if s.side == "COMPRA" else 0xE74C3C
-        title = f"🚨 Entrada {s.interval} — {s.side} (SPOT)"
+
+        title = f"{arrow} Entrada {s.interval} — {s.side} (SPOT)"
         desc = (
             f"**Ativo:** `{s.symbol}`\n"
+            f"**Direção:** {arrow} **{s.side}**\n"
             f"**Motivo:** {s.why}\n"
             f"**Camada:** `{s.tier.upper()}`\n\n"
             "🧠 Educacional — não é recomendação financeira."
         )
+
         e = discord.Embed(title=title, description=desc, color=color)
+
         e.add_field(name="💲 Preço", value=_fmt_price(s.price), inline=True)
-        e.add_field(name="🎯 Entrada", value=_fmt_price(s.entry), inline=True)
+        e.add_field(name=f"{arrow} Entrada", value=_fmt_price(s.entry), inline=True)
         e.add_field(name="🛡️ Stop", value=f"{_fmt_price(s.stop)}\nRisco: **{s.risk_pct:.2f}%**", inline=True)
+
         e.add_field(
             name="🏁 Alvos",
-            value=f"TP1: {_fmt_price(s.tp1)} (**{s.tp1_pct:.2f}%**)\nTP2: {_fmt_price(s.tp2)} (**{s.tp2_pct:.2f}%**)",
+            value=(
+                f"TP1: {_fmt_price(s.tp1)} (**{s.tp1_pct:.2f}%**)\n"
+                f"TP2: {_fmt_price(s.tp2)} (**{s.tp2_pct:.2f}%**)"
+            ),
             inline=False,
         )
+
         e.add_field(
             name="⏱️ Minuto de entrada",
             value=f"Próximo candle: **{s.next_time_str} BRT** (minuto **{s.next_minute:02d}**)",
             inline=False,
         )
+
         e.set_footer(text=f"Atlas Radar Pro • {datetime.now(BR_TZ).strftime('%d/%m/%Y %H:%M')} BRT")
         return e
 
+    # ✅ FINAL: Telegram também com setas
     def build_telegram(self, s: Signal) -> str:
+        arrow = "⬆️" if s.side == "COMPRA" else "⬇️"
         return (
-            f"🚨 Atlas Radar Pro — {s.side} (SPOT) [{s.interval}] / {s.tier.upper()}\n"
+            f"{arrow} Atlas Radar Pro — {s.side} (SPOT) [{s.interval}] / {s.tier.upper()}\n"
             f"Ativo: {s.symbol}\n"
             f"Preço: {_fmt_price(s.price)}\n"
             f"Entrada: {_fmt_price(s.entry)}\n"
@@ -210,7 +239,7 @@ class RadarEngine:
             # volume mult
             vm = None
             if len(v) >= lookback + 2:
-                base = v[-(lookback+1):-1]
+                base = v[-(lookback + 1):-1]
                 avg = (sum(base) / len(base)) if base else 0.0
                 if avg > 0:
                     vm = v[-1] / avg
@@ -222,7 +251,8 @@ class RadarEngine:
                 entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
                 out.append(Signal(
                     tier=tier, interval=interval, kind="SPIKE", symbol=sym, side=side, price=price,
-                    entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                    entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                    risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
                     why=f"Movimento do candle {interval}: {chg:+.2f}%",
                     score=self._score("SPIKE", abs_chg, vm),
                     next_time_str=nxt_dt.strftime("%H:%M"),
@@ -230,15 +260,16 @@ class RadarEngine:
                 ))
 
             # 2) BREAKOUT/BREAKDOWN (lookback)
-            hi = max(h[-(lookback+1):-1])
-            lo = min(l[-(lookback+1):-1])
+            hi = max(h[-(lookback + 1):-1])
+            lo = min(l[-(lookback + 1):-1])
             if vm is None or vm >= vol_mult_thr:
                 if price > hi:
                     side = "COMPRA"
                     entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
                     out.append(Signal(
                         tier=tier, interval=interval, kind="BREAK", symbol=sym, side=side, price=price,
-                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                        risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
                         why=f"Rompimento acima da máxima ({lookback} candles) + volume.",
                         score=self._score("BREAK", abs_chg, vm) + 10,
                         next_time_str=nxt_dt.strftime("%H:%M"),
@@ -249,7 +280,8 @@ class RadarEngine:
                     entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
                     out.append(Signal(
                         tier=tier, interval=interval, kind="BREAK", symbol=sym, side=side, price=price,
-                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                        risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
                         why=f"Perda abaixo da mínima ({lookback} candles) + volume.",
                         score=self._score("BREAK", abs_chg, vm) + 10,
                         next_time_str=nxt_dt.strftime("%H:%M"),
@@ -268,7 +300,8 @@ class RadarEngine:
                     entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
                     out.append(Signal(
                         tier=tier, interval=interval, kind="EMA", symbol=sym, side=side, price=price,
-                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                        risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
                         why="Tendência virou pra cima (EMA9 ↑ EMA21).",
                         score=self._score("EMA", abs_chg, vm),
                         next_time_str=nxt_dt.strftime("%H:%M"),
@@ -279,7 +312,8 @@ class RadarEngine:
                     entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
                     out.append(Signal(
                         tier=tier, interval=interval, kind="EMA", symbol=sym, side=side, price=price,
-                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                        risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
                         why="Tendência virou pra baixo (EMA9 ↓ EMA21) — em SPOT é proteção/realização.",
                         score=self._score("EMA", abs_chg, vm),
                         next_time_str=nxt_dt.strftime("%H:%M"),
