@@ -1,73 +1,80 @@
-# config.py — Atlas Radar Pro (SPOT-only)
+# config.py — Atlas Radar v4 (parcerias + canais por cargo)
 
-# Canal onde comandos podem ser executados (admin-bot)
-CANAL_ADMIN = 1467296892256911493  # <- ID do canal admin-bot
+# ── LINKS (PREENCHA)
+BINANCE_REF_LINK = "https://www.binance.com/referral/earn-together/refer2earn-usdc/claim?hl=pt-BR&ref=GRO_28502_8H34D&utm_source=default"
+BINOMO_REF_LINK  = "https://binomo-invitefriend.com/auth?invite_code=cdb1ad8837e4ffa1bf771e28824f5e0c#SignUp"
+DISCORD_INVITE_LINK = "https://discord.gg/NJ5EB97B"
 
-# Canais (restrinja por cargo no Discord: permissões do canal)
-CANAL_MEMBRO = 1468294566024052800       # <- canal somente cargo MEMBRO (4h)
-CANAL_INVESTIDOR = 1468861013138079859   # <- canal somente cargo INVESTIDOR (1m/5m/15m)
-CANAL_LOGS = 1467579765274837064         # opcional
+# ── CANAL ADMIN (onde pode usar comandos)
+CANAL_ADMIN = 1467296892256911493  # ID do canal admin-bot
 
-# Opcional: pingar cargos nas mensagens (0 = não pingar)
+# ── CANAIS BINANCE (SPOT/CRIPTO)
+CANAL_BINANCE_MEMBRO = 1468294566024052800       # canal só cargo MEMBRO
+CANAL_BINANCE_INVESTIDOR = 1468861013138079859   # canal só cargo INVESTIDOR
+
+# ── CANAIS BINOMO (ENTRADAS 1m/5m/15m)
+CANAL_BINOMO_MEMBRO = 1468877305651921090        # canal só cargo MEMBRO
+CANAL_BINOMO_INVESTIDOR = 1468877360697839688    # canal só cargo INVESTIDOR
+
+# ── CANAL NEWSLETTER / ALERTAS CRIPTO
+CANAL_NEWS_CRIPTO = 1466255506657251469
+
+# ── LOGS
+CANAL_LOGS = 1467579765274837064
+
+# ── CARGOS (opcional ping)
 ROLE_MEMBRO_ID = 1467902779447316512
 ROLE_INVESTIDOR_ID = 1467782321095577821
 
-# Telegram
+# ── TELEGRAM
 TELEGRAM_ENABLED = True
+TELEGRAM_SEND_BINANCE = True
+TELEGRAM_SEND_BINOMO  = False   # investidor pode virar spam — recomendo False
+TELEGRAM_SEND_NEWS    = True
 # ENV: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 
-# Liga/desliga motores
-RADAR_ENABLED = True
+# ── HORÁRIOS MEMBRO (4 por dia)
+# (BRT) 09:00 / 13:00 / 17:00 / 21:00
+MEMBRO_TIMES = ["09:00", "13:00", "17:00", "21:00"]
 
-# Watchlists
-WATCHLIST_MEMBRO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-WATCHLIST_INVESTIDOR = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+# ── INVESTIDOR: 5 por hora (a cada 12 min)
+INVESTIDOR_EVERY_MINUTES = 12
 
-# Frequências
-SCAN_SECONDS = 10  # loop interno (não é alerta). Alertas disparam por “slot” de candle.
+# ── WATCHLIST BINANCE (15 cripto “potencial / liquidez”)
+BINANCE_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
+    "ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","ARBUSDT",
+    "OPUSDT","INJUSDT","RNDRUSDT","SUIUSDT","MATICUSDT",
+]
 
-# Regras por timeframe
-RULES = {
-    "1m":  {"lookback": 30, "vol_mult": 1.20, "atr_period": 14},
-    "5m":  {"lookback": 24, "vol_mult": 1.25, "atr_period": 14},
-    "15m": {"lookback": 20, "vol_mult": 1.30, "atr_period": 14},
-    "4h":  {"lookback": 20, "vol_mult": 1.10, "atr_period": 14},
-}
+# ── ATIVOS “BINOMO” (15 instrumentos via Yahoo Chart)
+# (Você opera na plataforma, o bot só usa dados públicos pra gerar leitura)
+BINOMO_TICKERS = [
+    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X",
+    "USDCHF=X","NZDUSD=X","EURJPY=X","GBPJPY=X","XAUUSD=X",
+    "CL=F","GC=F","SI=F","^GSPC","^IXIC",
+]
 
+# ── REGRAS BINANCE (dips = chance de compra spot)
+# thresholds em % para considerar “queda”
+BINANCE_DIP_15M = -0.35
+BINANCE_DIP_1H  = -0.90
+BINANCE_TOP_N   = 3
+
+# ── REGRAS BINOMO (setup simples e consistente)
 EMA_FAST = 9
 EMA_SLOW = 21
+RSI_PERIOD = 14
+RSI_BUY_BELOW = 30
+RSI_SELL_ABOVE = 70
 
-# Anti-spam
-MAX_ALERTS_PER_CYCLE = {
-    "investidor": 6,
-    "membro": 3,
-}
-
-COOLDOWN_MINUTES = {
-    # investidor
-    ("investidor", "1m",  "SPIKE"): 10,
-    ("investidor", "1m",  "BREAK"): 20,
-    ("investidor", "1m",  "EMA"):   45,
-
-    ("investidor", "5m",  "SPIKE"): 20,
-    ("investidor", "5m",  "BREAK"): 45,
-    ("investidor", "5m",  "EMA"):   60,
-
-    ("investidor", "15m", "SPIKE"): 45,
-    ("investidor", "15m", "BREAK"): 90,
-    ("investidor", "15m", "EMA"):   120,
-
-    # membro (4h)
-    ("membro", "4h", "BREAK"): 360,
-    ("membro", "4h", "EMA"):   360,
-}
-
-# Trigger de “spike” (educacional)
-SPIKE_PCT = {
-    "1m": 0.35,   # mudança rápida (últimos 5 minutos via 1m closes)
-    "5m": 0.80,   # último candle 5m
-    "15m": 1.20,  # último candle 15m
-}
-
-# Slots de envio “membro” (4h) — minuto fixo pra ficar bonito
-MEMBRO_MINUTE = 5  # envia em 00:05, 04:05, 08:05, ...
+# ── NEWSLETTER (fontes RSS)
+NEWS_RSS_FEEDS = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("CryptoSlate", "https://cryptoslate.com/feed/"),
+    ("CryptoPotato", "https://cryptopotato.com/feed/"),
+    ("The Defiant", "https://thedefiant.io/feed/"),
+]
+NEWS_EVERY_MINUTES = 30
+NEWS_MAX_ITEMS = 6
