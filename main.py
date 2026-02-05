@@ -15,7 +15,7 @@ from notifier import Notifier
 from binance_spot import BinanceSpot
 from yahoo_data import YahooData
 from engines_binance import BinanceDipEngine
-from engines_binomo import BinomoEngine, is_market_open_for_non_crypto, is_crypto_ticker
+from engines_binomo import BinomoEngine
 from news_engine import NewsEngine
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
@@ -63,6 +63,11 @@ engine_news = NewsEngine()
 
 LOCK = asyncio.Lock()
 
+# “travas” por minuto para não spammar
+_last_member_minute = ""
+_last_invest_minute = ""
+_last_news_minute = ""
+
 async def log(msg: str):
     cid = int(getattr(config, "CANAL_LOGS", 0) or 0)
     if not cid:
@@ -76,195 +81,166 @@ async def log(msg: str):
     with contextlib.suppress(Exception):
         await ch.send(f"📡 {msg}")
 
-def _should_run_member_now() -> bool:
-    now = datetime.now(BR_TZ)
+def _minute_key() -> str:
+    return datetime.now(BR_TZ).strftime("%Y-%m-%d %H:%M")
+
+def _should_run_member_now(now: datetime) -> bool:
     hhmm = now.strftime("%H:%M")
     return hhmm in set(getattr(config, "MEMBRO_TIMES", []))
 
-def _minutes_mod(n: int) -> bool:
-    now = datetime.now(BR_TZ)
-    return (now.minute % n) == 0
+def _should_run_invest_now(now: datetime) -> bool:
+    every = int(getattr(config, "INVESTIDOR_EVERY_MINUTES", 12))
+    return (now.minute % every) == 0
 
-@tasks.loop(seconds=20)
+def _should_run_news_now(now: datetime) -> bool:
+    every = int(getattr(config, "NEWS_EVERY_MINUTES", 30))
+    return (now.minute % every) == 0
+
+async def _safe_send_discord(channel_id: int, embed: discord.Embed, ping: int = 0, tag: str = ""):
+    try:
+        await notifier.send_discord(channel_id, embed, role_ping_id=ping)
+        return True
+    except Exception as e:
+        await log(f"Falha envio Discord {tag}: {e}")
+        return False
+
+async def _safe_send_telegram(enabled: bool, text: str, tag: str = ""):
+    try:
+        await notifier.send_telegram(enabled, text)
+    except Exception as e:
+        await log(f"Falha envio Telegram {tag}: {e}")
+
+@tasks.loop(seconds=5)
 async def loop_member():
+    global _last_member_minute
+
     if notifier is None or binance is None or yahoo is None:
         return
+
     now = datetime.now(BR_TZ)
-    if now.second > 10:
+    mk = now.strftime("%Y-%m-%d %H:%M")
+    if mk == _last_member_minute:
         return
-    if not _should_run_member_now():
+    if not _should_run_member_now(now):
         return
     if LOCK.locked():
         return
+
+    _last_member_minute = mk
 
     async with LOCK:
         # BINANCE MEMBRO
         dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
         emb = engine_binance.build_embed(dips, tier="membro")
-        await notifier.send_discord(int(config.CANAL_BINANCE_MEMBRO), emb, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
-        await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "membro"))
+        ok = await _safe_send_discord(int(config.CANAL_BINANCE_MEMBRO), emb, ping=int(config.ROLE_MEMBRO_ID or 0), tag="BINANCE_MEMBRO")
+        if ok:
+            await _safe_send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "membro"), tag="BINANCE_MEMBRO")
 
-        # BINOMO MEMBRO (somente 15m pra ser “menos entradas” e mais qualidade)
+        # BINOMO MEMBRO (somente 15m)
         entries = []
         e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
         if e15:
             entries.append(e15)
-        # se mercado fechado (não-cripto), não manda
+
         if not entries:
-            await log("MEMBRO BINOMO: mercado fechado ou sem entrada (15m).")
+            await log("MEMBRO BINOMO: sem entrada (ou mercado fechado).")
         else:
             emb2 = engine_binomo.build_embed(entries, tier="membro")
-            await notifier.send_discord(int(config.CANAL_BINOMO_MEMBRO), emb2, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
-            await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "membro"))
+            ok2 = await _safe_send_discord(int(config.CANAL_BINOMO_MEMBRO), emb2, ping=int(config.ROLE_MEMBRO_ID or 0), tag="BINOMO_MEMBRO")
+            if ok2:
+                await _safe_send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "membro"), tag="BINOMO_MEMBRO")
 
-        await log("MEMBRO: envios executados.")
+        await log(f"MEMBRO OK ({mk})")
 
-@tasks.loop(seconds=20)
+@tasks.loop(seconds=5)
 async def loop_investidor():
+    global _last_invest_minute
+
     if notifier is None or binance is None or yahoo is None:
         return
+
     now = datetime.now(BR_TZ)
-    if now.second > 10:
+    mk = now.strftime("%Y-%m-%d %H:%M")
+    if mk == _last_invest_minute:
         return
-
-    every = int(getattr(config, "INVESTIDOR_EVERY_MINUTES", 12))
-    if not _minutes_mod(every):
+    if not _should_run_invest_now(now):
         return
-
     if LOCK.locked():
         return
 
+    _last_invest_minute = mk
+
     async with LOCK:
-        # BINANCE INVESTIDOR: top dips (5/h garantido por agenda)
+        # BINANCE INVESTIDOR
         dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
         emb = engine_binance.build_embed(dips, tier="investidor")
-        await notifier.send_discord(int(config.CANAL_BINANCE_INVESTIDOR), emb, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
-        await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "investidor"))
+        ok = await _safe_send_discord(int(config.CANAL_BINANCE_INVESTIDOR), emb, ping=int(config.ROLE_INVESTIDOR_ID or 0), tag="BINANCE_INV")
+        if ok:
+            await _safe_send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "investidor"), tag="BINANCE_INV")
 
-        # BINOMO INVESTIDOR: 1m/5m/15m (manda antes do slot)
+        # BINOMO INVESTIDOR: 1m/5m/15m
         entries = []
-        e1  = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "1m")
-        e5  = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "5m")
-        e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
-        for x in (e1, e5, e15):
-            if x:
-                entries.append(x)
+        for tf in ("1m", "5m", "15m"):
+            e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
+            if e:
+                entries.append(e)
 
         if not entries:
-            # se for fim de semana, avisa no log e não spamma canal
-            wd = datetime.utcnow().weekday()
-            if wd >= 5:
+            # “bolsa fechada”: fim de semana => loga e não envia
+            if datetime.utcnow().weekday() >= 5:
                 await log("INV BINOMO: mercado fechado (fim de semana). Sem envio.")
             else:
-                await log("INV BINOMO: sem entradas válidas agora.")
+                await log("INV BINOMO: sem entradas válidas.")
         else:
             emb2 = engine_binomo.build_embed(entries, tier="investidor")
-            await notifier.send_discord(int(config.CANAL_BINOMO_INVESTIDOR), emb2, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
-            await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "investidor"))
+            ok2 = await _safe_send_discord(int(config.CANAL_BINOMO_INVESTIDOR), emb2, ping=int(config.ROLE_INVESTIDOR_ID or 0), tag="BINOMO_INV")
+            if ok2:
+                await _safe_send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "investidor"), tag="BINOMO_INV")
 
-        await log("INVESTIDOR: envios executados.")
+        await log(f"INVESTIDOR OK ({mk})")
 
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=10)
 async def loop_news():
+    global _last_news_minute
+
     if notifier is None:
         return
+
     now = datetime.now(BR_TZ)
-    if now.second > 10:
+    mk = now.strftime("%Y-%m-%d %H:%M")
+    if mk == _last_news_minute:
         return
-    if not _minutes_mod(int(getattr(config, "NEWS_EVERY_MINUTES", 30))):
+    if not _should_run_news_now(now):
         return
+
+    _last_news_minute = mk
 
     items = engine_news.fetch()
     if items:
         engine_news.mark_seen(items)
 
     emb = engine_news.build_embed(items)
-    await notifier.send_discord(int(config.CANAL_NEWS_CRIPTO), emb, role_ping_id=0)
+    await _safe_send_discord(int(config.CANAL_NEWS_CRIPTO), emb, ping=0, tag="NEWS")
 
     if bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_NEWS):
-        await notifier.send_telegram(True, engine_news.build_telegram(items))
+        await _safe_send_telegram(True, engine_news.build_telegram(items), tag="NEWS")
 
-    await log(f"NEWS: enviados {len(items)} itens.")
+    await log(f"NEWS OK ({mk}) itens={len(items)}")
 
 # ─────────────────────────────
-# COMANDOS (novos, e só admin)
+# COMANDOS (admin)
 # ─────────────────────────────
 @tree.command(name="status", description="Status do Atlas Radar v4 (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
         "📡 **Atlas Radar v4**\n"
-        f"Binance membro: `{config.CANAL_BINANCE_MEMBRO}` | investidor: `{config.CANAL_BINANCE_INVESTIDOR}`\n"
-        f"Binomo  membro: `{config.CANAL_BINOMO_MEMBRO}`  | investidor: `{config.CANAL_BINOMO_INVESTIDOR}`\n"
-        f"News channel: `{config.CANAL_NEWS_CRIPTO}` | Logs: `{config.CANAL_LOGS}`\n"
+        f"BINANCE membro: `{config.CANAL_BINANCE_MEMBRO}` | investidor: `{config.CANAL_BINANCE_INVESTIDOR}`\n"
+        f"BINOMO  membro: `{config.CANAL_BINOMO_MEMBRO}` | investidor: `{config.CANAL_BINOMO_INVESTIDOR}`\n"
+        f"NEWS: `{config.CANAL_NEWS_CRIPTO}` | LOGS: `{config.CANAL_LOGS}`\n"
         f"Telegram: `{config.TELEGRAM_ENABLED}`\n",
         ephemeral=True
     )
-
-@tree.command(name="force_binance", description="Força envio Binance (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.choices(tier=[
-    app_commands.Choice(name="membro", value="membro"),
-    app_commands.Choice(name="investidor", value="investidor"),
-])
-async def force_binance(interaction: discord.Interaction, tier: app_commands.Choice[str]):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    if notifier is None or binance is None:
-        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
-        return
-    async with LOCK:
-        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-        emb = engine_binance.build_embed(dips, tier=tier.value)
-        ch = int(config.CANAL_BINANCE_MEMBRO if tier.value == "membro" else config.CANAL_BINANCE_INVESTIDOR)
-        ping = int(config.ROLE_MEMBRO_ID if tier.value == "membro" else config.ROLE_INVESTIDOR_ID or 0)
-        await notifier.send_discord(ch, emb, role_ping_id=ping)
-    await interaction.followup.send("✅ Enviado.", ephemeral=True)
-
-@tree.command(name="force_binomo", description="Força envio Binomo (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.choices(tier=[
-    app_commands.Choice(name="membro", value="membro"),
-    app_commands.Choice(name="investidor", value="investidor"),
-])
-async def force_binomo(interaction: discord.Interaction, tier: app_commands.Choice[str]):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    if notifier is None or yahoo is None:
-        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
-        return
-    async with LOCK:
-        entries = []
-        if tier.value == "membro":
-            e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
-            if e15: entries.append(e15)
-            ch = int(config.CANAL_BINOMO_MEMBRO)
-            ping = int(config.ROLE_MEMBRO_ID or 0)
-        else:
-            for tf in ("1m","5m","15m"):
-                e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
-                if e: entries.append(e)
-            ch = int(config.CANAL_BINOMO_INVESTIDOR)
-            ping = int(config.ROLE_INVESTIDOR_ID or 0)
-
-        if not entries:
-            await interaction.followup.send("📭 Sem entradas (ou mercado fechado).", ephemeral=True)
-            return
-
-        emb = engine_binomo.build_embed(entries, tier=tier.value)
-        await notifier.send_discord(ch, emb, role_ping_id=ping)
-    await interaction.followup.send("✅ Enviado.", ephemeral=True)
-
-@tree.command(name="news_now", description="Força newsletter agora (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def news_now(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    items = engine_news.fetch()
-    if items:
-        engine_news.mark_seen(items)
-    emb = engine_news.build_embed(items)
-    await notifier.send_discord(int(config.CANAL_NEWS_CRIPTO), emb, role_ping_id=0)
-    if bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_NEWS):
-        await notifier.send_telegram(True, engine_news.build_telegram(items))
-    await interaction.followup.send(f"✅ News enviada ({len(items)} itens).", ephemeral=True)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
