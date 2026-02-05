@@ -35,10 +35,10 @@ TELEGRAM_SEND_NEWS    = True
 
 # ── HORÁRIOS MEMBRO (4 por dia)
 # (BRT) 09:00 / 13:00 / 17:00 / 21:00
-MEMBRO_TIMES = ["09:00", "13:00", "17:00", "21:00"]
+MEMBRO_TIMES = ["09:00","13:00","16:00","20:00"]
 
 # ── INVESTIDOR: 5 por hora (a cada 12 min)
-INVESTIDOR_EVERY_MINUTES = 12
+INVESTIDOR_EVERY_MINUTES = 10
 
 # ── WATCHLIST BINANCE (15 cripto “potencial / liquidez”)
 BINANCE_SYMBOLS = [
