@@ -68,13 +68,19 @@ RSI_PERIOD = 14
 RSI_BUY_BELOW = 30
 RSI_SELL_ABOVE = 70
 
-# ── NEWSLETTER (fontes RSS)
-NEWS_RSS_FEEDS = [
+# ── NEWSLETTER (PT + EN)
+NEWS_RSS_FEEDS_PT = [
+    ("Guia do Bitcoin", "https://guiadobitcoin.com.br/noticias/feed/"),
+    ("Guia do Bitcoin • Mercados", "https://guiadobitcoin.com.br/noticias/categoria/mercados/feed/"),
+]
+
+NEWS_RSS_FEEDS_EN = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"),
     ("Cointelegraph", "https://cointelegraph.com/rss"),
     ("CryptoSlate", "https://cryptoslate.com/feed/"),
     ("CryptoPotato", "https://cryptopotato.com/feed/"),
     ("The Defiant", "https://thedefiant.io/feed/"),
 ]
+
 NEWS_EVERY_MINUTES = 30
-NEWS_MAX_ITEMS = 6
+NEWS_MAX_ITEMS_EACH = 4
