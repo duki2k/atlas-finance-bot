@@ -23,6 +23,7 @@ BR_TZ = pytz.timezone("America/Sao_Paulo")
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = (os.getenv("GUILD_ID") or "").strip()
 SYNC_COMMANDS = (os.getenv("SYNC_COMMANDS") or "1").strip() == "1"
+LOG_SKIPS = (os.getenv("LOG_SKIPS") or "0").strip() == "1"  # 1=logar SKIPs (debug)
 
 intents = discord.Intents.default()
 
@@ -110,7 +111,6 @@ def _should_run_news(now: datetime) -> bool:
 
 
 def _should_run_binance_invest_hourly(now: datetime) -> bool:
-    # 1x por hora no minuto 00
     return now.minute == 0
 
 
@@ -148,9 +148,6 @@ async def _send_or_fail(channel_id: int, embed: discord.Embed, role_ping: int = 
         return False, f"{tag} {e}"
 
 
-# ─────────────────────────────
-# LOOP BINANCE MENTOR (INV: 1x/h, MEMBRO: horários grade)
-# ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_binance_mentor():
     global _last_binance_hour_member, _last_binance_hour_invest
@@ -161,7 +158,6 @@ async def loop_binance_mentor():
     hour_key = now.strftime("%Y-%m-%d %H")
 
     async with LOCK:
-        # INVESTIDOR: 1x/h
         if _should_run_binance_invest_hourly(now) and _last_binance_hour_invest != hour_key:
             picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
             emb = engine_binance.build_embed(picks, tier="investidor")
@@ -171,7 +167,6 @@ async def loop_binance_mentor():
             _last_binance_hour_invest = hour_key
             await log(f"BINANCE MENTOR INVEST OK {hour_key}")
 
-        # MEMBRO: segue a grade (4/dia normalmente)
         minute_key = now.strftime("%Y-%m-%d %H:%M")
         if _should_run_member(now) and _last_binance_hour_member != minute_key:
             picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
@@ -188,9 +183,6 @@ async def loop_binance_mentor_error(err: Exception):
     await log(f"ERRO loop_binance_mentor: {err}")
 
 
-# ─────────────────────────────
-# LOOP BINOMO (TRADING)
-# ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_member():
     global _last_member_minute
@@ -203,14 +195,14 @@ async def loop_member():
         return
 
     if not _should_run_member(now):
-        await log(f"MEMBRO SKIP {minute_key} (fora da grade)")
+        if LOG_SKIPS:
+            await log(f"MEMBRO SKIP {minute_key} (fora da grade)")
         _last_member_minute = minute_key
         return
 
     _last_member_minute = minute_key
 
     async with LOCK:
-        # Binomo membro: 15m (menos spam, mais seletivo)
         entries = []
         e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
         if e15:
@@ -242,14 +234,14 @@ async def loop_investidor():
         return
 
     if not _should_run_invest(now):
-        await log(f"INV SKIP {minute_key} (minuto não bate)")
+        if LOG_SKIPS:
+            await log(f"INV SKIP {minute_key} (minuto não bate)")
         _last_invest_minute = minute_key
         return
 
     _last_invest_minute = minute_key
 
     async with LOCK:
-        # Binomo investidor: 1m/5m/15m (trading)
         entries = []
         for tf in ("1m", "5m", "15m"):
             e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
@@ -275,9 +267,6 @@ async def loop_investidor_error(err: Exception):
     await log(f"ERRO loop_investidor: {err}")
 
 
-# ─────────────────────────────
-# LOOP NEWS (PT=tradução do EN base)
-# ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_news():
     global _last_news_minute
@@ -311,9 +300,6 @@ async def loop_news_error(err: Exception):
     await log(f"ERRO loop_news: {err}")
 
 
-# ─────────────────────────────
-# COMANDOS (ADMIN)
-# ─────────────────────────────
 @client.tree.command(name="status", description="Status do Atlas (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def status(interaction: discord.Interaction):
@@ -347,7 +333,6 @@ async def force_all(interaction: discord.Interaction):
     fails = []
 
     async with LOCK:
-        # Binance mentor membro
         try:
             picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
             emb = engine_binance.build_embed(picks, tier="membro") if picks else _test_embed("Binance MEMBRO", "Sem picks — teste OK ✅")
@@ -356,7 +341,6 @@ async def force_all(interaction: discord.Interaction):
         except Exception as e:
             fails.append(f"❌ Binance MEMBRO ({e})")
 
-        # Binance mentor investidor
         try:
             picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
             emb = engine_binance.build_embed(picks, tier="investidor") if picks else _test_embed("Binance INVESTIDOR", "Sem picks — teste OK ✅")
@@ -365,7 +349,6 @@ async def force_all(interaction: discord.Interaction):
         except Exception as e:
             fails.append(f"❌ Binance INVESTIDOR ({e})")
 
-        # Binomo membro (15m)
         try:
             entries = []
             e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
@@ -379,7 +362,6 @@ async def force_all(interaction: discord.Interaction):
         except Exception as e:
             fails.append(f"❌ Binomo MEMBRO ({e})")
 
-        # Binomo investidor (1m/5m/15m)
         try:
             entries = []
             for tf in ("1m", "5m", "15m"):
@@ -392,7 +374,6 @@ async def force_all(interaction: discord.Interaction):
         except Exception as e:
             fails.append(f"❌ Binomo INVESTIDOR ({e})")
 
-        # News PT/EN (mesma notícia traduzida)
         try:
             pt, en, sources, translated_ok = await engine_news.fetch(HTTP)
             engine_news.mark_seen(en)
