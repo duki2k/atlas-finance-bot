@@ -1,8 +1,3 @@
-# main.py — Atlas Radar Pro (FINAL) ✅
-# SPOT-only | Canal MEMBRO (4h) + Canal INVESTIDOR (1m/5m/15m)
-# Comandos: /status /scan_membro /scan_investidor /pause /resume
-# Bloqueio: comandos só no canal CANAL_ADMIN (config.py)
-
 import os
 import asyncio
 import contextlib
@@ -11,14 +6,19 @@ from datetime import datetime
 
 import aiohttp
 import discord
-import pytz
 from discord.ext import tasks
 from discord import app_commands
+import pytz
 
 import config
-from binance_spot import BinanceSpot
 from notifier import Notifier
-from radar import RadarEngine, BR_TZ
+from binance_spot import BinanceSpot
+from yahoo_data import YahooData
+from engines_binance import BinanceDipEngine
+from engines_binomo import BinomoEngine, is_market_open_for_non_crypto, is_crypto_ticker
+from news_engine import NewsEngine
+
+BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = (os.getenv("GUILD_ID") or "").strip()
@@ -29,9 +29,6 @@ client = discord.Client(intents=intents)
 
 ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
 
-# ─────────────────────────────
-# CommandTree com bloqueio de canal (discord.py compatível)
-# ─────────────────────────────
 async def _deny(interaction: discord.Interaction, msg: str):
     try:
         if interaction.response.is_done():
@@ -46,32 +43,25 @@ class AtlasTree(app_commands.CommandTree):
         if ADMIN_CHANNEL_ID <= 0:
             return True
         if interaction.guild is None:
-            await _deny(interaction, "⛔ Comandos disponíveis apenas no servidor.")
+            await _deny(interaction, "⛔ Comandos apenas no servidor.")
             return False
         if interaction.channel_id != ADMIN_CHANNEL_ID:
-            await _deny(interaction, f"⛔ Use os comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
+            await _deny(interaction, f"⛔ Use comandos apenas em <#{ADMIN_CHANNEL_ID}>.")
             return False
         return True
 
 tree = AtlasTree(client)
 
-HTTP_SESSION: aiohttp.ClientSession | None = None
+HTTP: aiohttp.ClientSession | None = None
 notifier: Notifier | None = None
 binance: BinanceSpot | None = None
-engine = RadarEngine()
+yahoo: YahooData | None = None
+
+engine_binance = BinanceDipEngine()
+engine_binomo = BinomoEngine()
+engine_news = NewsEngine()
 
 LOCK = asyncio.Lock()
-
-# slots (evita duplicar)
-_last_1m = None
-_last_5m = None
-_last_15m = None
-_last_4h = None
-
-# “pulso sem setup” no canal investidor (anti-spam)
-_last_no_setup_inv_ts = 0.0
-NO_SETUP_INV_COOLDOWN_SECONDS = 30 * 60  # 30 minutos
-
 
 async def log(msg: str):
     cid = int(getattr(config, "CANAL_LOGS", 0) or 0)
@@ -86,230 +76,195 @@ async def log(msg: str):
     with contextlib.suppress(Exception):
         await ch.send(f"📡 {msg}")
 
-
-async def post_no_setup_investidor(slot: str):
-    """
-    Quando não há setups, envia um embed informativo (profissional) no canal INVESTIDOR,
-    mas no máximo 1x a cada NO_SETUP_INV_COOLDOWN_SECONDS.
-    """
-    global _last_no_setup_inv_ts
-
-    if notifier is None:
-        return
-
+def _should_run_member_now() -> bool:
     now = datetime.now(BR_TZ)
-    now_ts = now.timestamp()
-    if (now_ts - _last_no_setup_inv_ts) < NO_SETUP_INV_COOLDOWN_SECONDS:
-        return
+    hhmm = now.strftime("%H:%M")
+    return hhmm in set(getattr(config, "MEMBRO_TIMES", []))
 
-    channel_id = int(getattr(config, "CANAL_INVESTIDOR", 0) or 0)
-    if not channel_id:
-        return
-
-    emb = discord.Embed(
-        title="📭 Radar INVESTIDOR — Sem entradas agora",
-        description=(
-            f"Nenhum setup bateu nas regras neste ciclo (**{slot}**).\n"
-            "Isso é normal — **melhor ficar parado** do que forçar operação.\n\n"
-            "🧠 **Playbook rápido:**\n"
-            "• Preserve caixa\n"
-            "• Espere confirmação\n"
-            "• Não aumente mão por ansiedade\n\n"
-            "Educacional — não é recomendação financeira."
-        ),
-        color=0x95A5A6,
-    )
-    emb.set_footer(text=f"{now.strftime('%d/%m/%Y %H:%M')} BRT")
-
-    try:
-        await notifier.send_discord(channel_id, emb, role_ping_id=0)
-        _last_no_setup_inv_ts = now_ts
-    except Exception:
-        pass
-
-
-async def _post_signals(tier: str, interval: str, force: bool):
-    if notifier is None or binance is None:
-        return 0, 0
-    if not getattr(config, "RADAR_ENABLED", False):
-        return 0, 0
-    if engine.paused() and not force:
-        return 0, 0
-
-    if tier == "membro":
-        symbols = list(getattr(config, "WATCHLIST_MEMBRO", []))
-        channel_id = int(getattr(config, "CANAL_MEMBRO", 0) or 0)
-        role_ping = int(getattr(config, "ROLE_MEMBRO_ID", 0) or 0)
-    else:
-        symbols = list(getattr(config, "WATCHLIST_INVESTIDOR", []))
-        channel_id = int(getattr(config, "CANAL_INVESTIDOR", 0) or 0)
-        role_ping = int(getattr(config, "ROLE_INVESTIDOR_ID", 0) or 0)
-
-    if not symbols or not channel_id:
-        return 0, 0
-
-    sigs = await engine.scan(binance, tier=tier, interval=interval, symbols=symbols)
-
-    sent = 0
-    for s in sigs:
-        if force or engine._can_send(s):
-            emb = engine.build_embed(s)
-            await notifier.send_discord(channel_id, emb, role_ping_id=role_ping)
-            await notifier.send_telegram(bool(getattr(config, "TELEGRAM_ENABLED", True)), engine.build_telegram(s))
-            sent += 1
-
-    return sent, len(sigs)
-
-
-@tasks.loop(seconds=10)
-async def investidor_loop():
-    global _last_1m, _last_5m, _last_15m
-
-    if notifier is None or binance is None:
-        return
-
+def _minutes_mod(n: int) -> bool:
     now = datetime.now(BR_TZ)
-
-    # Executa no começo do minuto (reduz drift)
-    if now.second > 10:
-        return
-
-    slot = now.strftime("%Y-%m-%d %H:%M")
-
-    if LOCK.locked():
-        return
-
-    cand_1m = 0
-    cand_5m = 0
-    cand_15m = 0
-    sent_1m = 0
-    sent_5m = 0
-    sent_15m = 0
-
-    async with LOCK:
-        # 1m (todo minuto)
-        if _last_1m != slot:
-            sent_1m, cand_1m = await _post_signals("investidor", "1m", force=False)
-            await log(f"INV 1m slot {slot}: candidatos={cand_1m} enviados={sent_1m}")
-            _last_1m = slot
-
-        # 5m (minuto múltiplo de 5)
-        if now.minute % 5 == 0 and _last_5m != slot:
-            sent_5m, cand_5m = await _post_signals("investidor", "5m", force=False)
-            await log(f"INV 5m slot {slot}: candidatos={cand_5m} enviados={sent_5m}")
-            _last_5m = slot
-
-        # 15m (minuto múltiplo de 15)
-        if now.minute % 15 == 0 and _last_15m != slot:
-            sent_15m, cand_15m = await _post_signals("investidor", "15m", force=False)
-            await log(f"INV 15m slot {slot}: candidatos={cand_15m} enviados={sent_15m}")
-            _last_15m = slot
-
-            # ✅ Pulso “sem setup” — só em slot 15m (mais limpo e profissional)
-            if cand_15m == 0 and cand_5m == 0 and cand_1m == 0:
-                await post_no_setup_investidor(slot)
-
+    return (now.minute % n) == 0
 
 @tasks.loop(seconds=20)
-async def membro_loop():
-    global _last_4h
-
-    if notifier is None or binance is None:
+async def loop_member():
+    if notifier is None or binance is None or yahoo is None:
+        return
+    now = datetime.now(BR_TZ)
+    if now.second > 10:
+        return
+    if not _should_run_member_now():
+        return
+    if LOCK.locked():
         return
 
-    now = datetime.now(BR_TZ)
+    async with LOCK:
+        # BINANCE MEMBRO
+        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+        emb = engine_binance.build_embed(dips, tier="membro")
+        await notifier.send_discord(int(config.CANAL_BINANCE_MEMBRO), emb, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
+        await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "membro"))
 
+        # BINOMO MEMBRO (somente 15m pra ser “menos entradas” e mais qualidade)
+        entries = []
+        e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
+        if e15:
+            entries.append(e15)
+        # se mercado fechado (não-cripto), não manda
+        if not entries:
+            await log("MEMBRO BINOMO: mercado fechado ou sem entrada (15m).")
+        else:
+            emb2 = engine_binomo.build_embed(entries, tier="membro")
+            await notifier.send_discord(int(config.CANAL_BINOMO_MEMBRO), emb2, role_ping_id=int(config.ROLE_MEMBRO_ID or 0))
+            await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "membro"))
+
+        await log("MEMBRO: envios executados.")
+
+@tasks.loop(seconds=20)
+async def loop_investidor():
+    if notifier is None or binance is None or yahoo is None:
+        return
+    now = datetime.now(BR_TZ)
     if now.second > 10:
         return
 
-    # 4h em horas múltiplas de 4, no minuto fixo (ex.: 00:05, 04:05, 08:05, ...)
-    if now.hour % 4 != 0:
-        return
-    if now.minute != int(getattr(config, "MEMBRO_MINUTE", 5)):
-        return
-
-    slot = now.strftime("%Y-%m-%d %H:%M")
-    if _last_4h == slot:
+    every = int(getattr(config, "INVESTIDOR_EVERY_MINUTES", 12))
+    if not _minutes_mod(every):
         return
 
     if LOCK.locked():
         return
 
     async with LOCK:
-        sent, cand = await _post_signals("membro", "4h", force=False)
-        await log(f"MEMBRO 4h slot {slot}: candidatos={cand} enviados={sent}")
-        _last_4h = slot
+        # BINANCE INVESTIDOR: top dips (5/h garantido por agenda)
+        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+        emb = engine_binance.build_embed(dips, tier="investidor")
+        await notifier.send_discord(int(config.CANAL_BINANCE_INVESTIDOR), emb, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
+        await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINANCE), engine_binance.build_telegram(dips, "investidor"))
 
+        # BINOMO INVESTIDOR: 1m/5m/15m (manda antes do slot)
+        entries = []
+        e1  = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "1m")
+        e5  = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "5m")
+        e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
+        for x in (e1, e5, e15):
+            if x:
+                entries.append(x)
+
+        if not entries:
+            # se for fim de semana, avisa no log e não spamma canal
+            wd = datetime.utcnow().weekday()
+            if wd >= 5:
+                await log("INV BINOMO: mercado fechado (fim de semana). Sem envio.")
+            else:
+                await log("INV BINOMO: sem entradas válidas agora.")
+        else:
+            emb2 = engine_binomo.build_embed(entries, tier="investidor")
+            await notifier.send_discord(int(config.CANAL_BINOMO_INVESTIDOR), emb2, role_ping_id=int(config.ROLE_INVESTIDOR_ID or 0))
+            await notifier.send_telegram(bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_BINOMO), engine_binomo.build_telegram(entries, "investidor"))
+
+        await log("INVESTIDOR: envios executados.")
+
+@tasks.loop(seconds=30)
+async def loop_news():
+    if notifier is None:
+        return
+    now = datetime.now(BR_TZ)
+    if now.second > 10:
+        return
+    if not _minutes_mod(int(getattr(config, "NEWS_EVERY_MINUTES", 30))):
+        return
+
+    items = engine_news.fetch()
+    if items:
+        engine_news.mark_seen(items)
+
+    emb = engine_news.build_embed(items)
+    await notifier.send_discord(int(config.CANAL_NEWS_CRIPTO), emb, role_ping_id=0)
+
+    if bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_NEWS):
+        await notifier.send_telegram(True, engine_news.build_telegram(items))
+
+    await log(f"NEWS: enviados {len(items)} itens.")
 
 # ─────────────────────────────
-# Commands (SÓ ESTES)
+# COMANDOS (novos, e só admin)
 # ─────────────────────────────
-@tree.command(name="status", description="Status geral do Radar Pro (Admin)")
+@tree.command(name="status", description="Status do Atlas Radar v4 (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def status(interaction: discord.Interaction):
     await interaction.response.send_message(
-        f"📡 **Atlas Radar Pro (SPOT-only)**\n"
-        f"RADAR_ENABLED: `{getattr(config, 'RADAR_ENABLED', False)}`\n"
-        f"Paused: `{engine.paused()}`\n"
-        f"CANAL_MEMBRO: `{getattr(config, 'CANAL_MEMBRO', 0)}` | watchlist={len(getattr(config,'WATCHLIST_MEMBRO',[]))}\n"
-        f"CANAL_INVESTIDOR: `{getattr(config, 'CANAL_INVESTIDOR', 0)}` | watchlist={len(getattr(config,'WATCHLIST_INVESTIDOR',[]))}\n"
-        f"Telegram: `{getattr(config, 'TELEGRAM_ENABLED', False)}`\n",
+        "📡 **Atlas Radar v4**\n"
+        f"Binance membro: `{config.CANAL_BINANCE_MEMBRO}` | investidor: `{config.CANAL_BINANCE_INVESTIDOR}`\n"
+        f"Binomo  membro: `{config.CANAL_BINOMO_MEMBRO}`  | investidor: `{config.CANAL_BINOMO_INVESTIDOR}`\n"
+        f"News channel: `{config.CANAL_NEWS_CRIPTO}` | Logs: `{config.CANAL_LOGS}`\n"
+        f"Telegram: `{config.TELEGRAM_ENABLED}`\n",
         ephemeral=True
     )
 
-@tree.command(name="scan_membro", description="Força envio MEMBRO (4h) agora (Admin)")
+@tree.command(name="force_binance", description="Força envio Binance (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
-async def scan_membro(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    if LOCK.locked():
-        await interaction.followup.send("⏳ Já tem execução em andamento.", ephemeral=True)
-        return
-    async with LOCK:
-        sent, cand = await _post_signals("membro", "4h", force=True)
-    await interaction.followup.send(f"✅ MEMBRO 4h: candidatos={cand} enviados={sent}", ephemeral=True)
-
-@tree.command(name="scan_investidor", description="Força envio INVESTIDOR (1m/5m/15m) (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.choices(timeframe=[
-    app_commands.Choice(name="1m", value="1m"),
-    app_commands.Choice(name="5m", value="5m"),
-    app_commands.Choice(name="15m", value="15m"),
-    app_commands.Choice(name="all", value="all"),
+@app_commands.choices(tier=[
+    app_commands.Choice(name="membro", value="membro"),
+    app_commands.Choice(name="investidor", value="investidor"),
 ])
-async def scan_investidor(interaction: discord.Interaction, timeframe: app_commands.Choice[str]):
+async def force_binance(interaction: discord.Interaction, tier: app_commands.Choice[str]):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    if LOCK.locked():
-        await interaction.followup.send("⏳ Já tem execução em andamento.", ephemeral=True)
+    if notifier is None or binance is None:
+        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
         return
-
-    sent_total = 0
-    cand_total = 0
-
     async with LOCK:
-        if timeframe.value in ("1m", "all"):
-            s, c = await _post_signals("investidor", "1m", force=True)
-            sent_total += s; cand_total += c
-        if timeframe.value in ("5m", "all"):
-            s, c = await _post_signals("investidor", "5m", force=True)
-            sent_total += s; cand_total += c
-        if timeframe.value in ("15m", "all"):
-            s, c = await _post_signals("investidor", "15m", force=True)
-            sent_total += s; cand_total += c
+        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
+        emb = engine_binance.build_embed(dips, tier=tier.value)
+        ch = int(config.CANAL_BINANCE_MEMBRO if tier.value == "membro" else config.CANAL_BINANCE_INVESTIDOR)
+        ping = int(config.ROLE_MEMBRO_ID if tier.value == "membro" else config.ROLE_INVESTIDOR_ID or 0)
+        await notifier.send_discord(ch, emb, role_ping_id=ping)
+    await interaction.followup.send("✅ Enviado.", ephemeral=True)
 
-    await interaction.followup.send(f"✅ INVESTIDOR {timeframe.value}: candidatos={cand_total} enviados={sent_total}", ephemeral=True)
-
-@tree.command(name="pause", description="Pausa alertas por X minutos (Admin)")
+@tree.command(name="force_binomo", description="Força envio Binomo (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
-async def pause(interaction: discord.Interaction, minutos: int):
-    minutes = max(1, min(1440, int(minutos)))
-    engine.pause_minutes(minutes)
-    await interaction.response.send_message(f"⏸️ Alertas pausados por {minutes} minutos.", ephemeral=True)
+@app_commands.choices(tier=[
+    app_commands.Choice(name="membro", value="membro"),
+    app_commands.Choice(name="investidor", value="investidor"),
+])
+async def force_binomo(interaction: discord.Interaction, tier: app_commands.Choice[str]):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if notifier is None or yahoo is None:
+        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
+        return
+    async with LOCK:
+        entries = []
+        if tier.value == "membro":
+            e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
+            if e15: entries.append(e15)
+            ch = int(config.CANAL_BINOMO_MEMBRO)
+            ping = int(config.ROLE_MEMBRO_ID or 0)
+        else:
+            for tf in ("1m","5m","15m"):
+                e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
+                if e: entries.append(e)
+            ch = int(config.CANAL_BINOMO_INVESTIDOR)
+            ping = int(config.ROLE_INVESTIDOR_ID or 0)
 
-@tree.command(name="resume", description="Retoma alertas (Admin)")
+        if not entries:
+            await interaction.followup.send("📭 Sem entradas (ou mercado fechado).", ephemeral=True)
+            return
+
+        emb = engine_binomo.build_embed(entries, tier=tier.value)
+        await notifier.send_discord(ch, emb, role_ping_id=ping)
+    await interaction.followup.send("✅ Enviado.", ephemeral=True)
+
+@tree.command(name="news_now", description="Força newsletter agora (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
-async def resume(interaction: discord.Interaction):
-    engine.resume()
-    await interaction.response.send_message("▶️ Alertas retomados.", ephemeral=True)
+async def news_now(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    items = engine_news.fetch()
+    if items:
+        engine_news.mark_seen(items)
+    emb = engine_news.build_embed(items)
+    await notifier.send_discord(int(config.CANAL_NEWS_CRIPTO), emb, role_ping_id=0)
+    if bool(config.TELEGRAM_ENABLED and config.TELEGRAM_SEND_NEWS):
+        await notifier.send_telegram(True, engine_news.build_telegram(items))
+    await interaction.followup.send(f"✅ News enviada ({len(items)} itens).", ephemeral=True)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -317,7 +272,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await _deny(interaction, "❌ Sem permissão.")
         return
     await log(f"Erro slash: {error}")
-
 
 @client.event
 async def on_ready():
@@ -336,25 +290,24 @@ async def on_ready():
         except Exception as e:
             await log(f"Falha sync: {e}")
 
-    if not investidor_loop.is_running():
-        investidor_loop.start()
-    if not membro_loop.is_running():
-        membro_loop.start()
-
+    if not loop_member.is_running():
+        loop_member.start()
+    if not loop_investidor.is_running():
+        loop_investidor.start()
+    if not loop_news.is_running():
+        loop_news.start()
 
 async def shutdown(reason: str):
     await log(f"Shutdown: {reason}")
     with contextlib.suppress(Exception):
-        if investidor_loop.is_running():
-            investidor_loop.cancel()
-    with contextlib.suppress(Exception):
-        if membro_loop.is_running():
-            membro_loop.cancel()
+        if loop_member.is_running(): loop_member.cancel()
+        if loop_investidor.is_running(): loop_investidor.cancel()
+        if loop_news.is_running(): loop_news.cancel()
 
-    global HTTP_SESSION
+    global HTTP
     with contextlib.suppress(Exception):
-        if HTTP_SESSION and not HTTP_SESSION.closed:
-            await HTTP_SESSION.close()
+        if HTTP and not HTTP.closed:
+            await HTTP.close()
 
     with contextlib.suppress(Exception):
         await client.close()
@@ -375,13 +328,14 @@ async def main():
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    global HTTP_SESSION, notifier, binance
-    timeout = aiohttp.ClientTimeout(total=20)
-    connector = aiohttp.TCPConnector(limit=50)
-    HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    global HTTP, notifier, binance, yahoo
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(limit=60)
+    HTTP = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-    notifier = Notifier(client=client, session=HTTP_SESSION)
-    binance = BinanceSpot(HTTP_SESSION)
+    notifier = Notifier(client=client, session=HTTP)
+    binance = BinanceSpot(HTTP)
+    yahoo = YahooData(HTTP)
 
     async with client:
         await client.start(TOKEN)
