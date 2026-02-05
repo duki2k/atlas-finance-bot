@@ -1,112 +1,27 @@
-import os
+# config.py (Atlas Radar v3 - SPOT)
+# ✅ Ajuste os IDs abaixo
 
-# config.py
-
+# Canal onde comandos podem ser executados (admin-bot)
 CANAL_ADMIN = 1467296892256911493
-CANAL_ANALISE = 1466255506657251469
-CANAL_NOTICIAS = 1466895475415191583
-CANAL_LOGS = 1467579765274837064
 
-NEWS_ATIVAS = True
+# Canais onde o bot publica alertas e pulso
+CANAL_ALERTAS = 1466255506657251469  # <- coloque o ID do canal #alertas
+CANAL_PULSO   = 1468294566024052800  # <- coloque o ID do canal #pulso (pode ser o mesmo)
+CANAL_LOGS    = 1467579765274837064  # opcional
 
-# Rompimento (%). Sugestão: 1.0 cripto / 1.5 ações / 2.0 fiis.
-# Aqui é geral (simples). Depois dá pra separar por categoria.
-LIMITE_ROMPIMENTO_PCT = 2.0
+# (Opcional) Ping de cargo em alertas: coloque 0 pra não pingar
+ROLE_PING_ID = 0  # ex: 123456789012345678
 
-# Portfólio por categoria (edite à vontade)
-ATIVOS = {
-    "🪙 Criptomoedas": [
-        "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD",
-        "ADA-USD", "AVAX-USD", "DOT-USD", "LINK-USD", "MATIC-USD",
-    ],
-    "🇺🇸 Ações EUA": [
-        "AAPL", "MSFT", "AMZN", "GOOGL", "NVDA",
-        "META", "TSLA", "BRK-B", "JPM", "V",
-    ],
-    "🇧🇷 Ações Brasil": [
-        "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "BBAS3.SA",
-        "WEGE3.SA", "ABEV3.SA", "B3SA3.SA", "RENT3.SA", "SUZB3.SA",
-    ],
-    "🏢 FIIs Brasil": [
-        "HGLG11.SA", "XPML11.SA", "MXRF11.SA", "VISC11.SA", "BCFF11.SA",
-        "KNRI11.SA", "RECT11.SA", "HGRE11.SA", "CPTS11.SA", "IRDM11.SA",
-    ],
-    "📦 ETFs EUA": [
-        "SPY", "QQQ", "VOO", "IVV", "VTI",
-        "DIA", "IWM", "EFA", "VEA", "VNQ",
-    ],
-}
+# Telegram
+TELEGRAM_ENABLED = True  # se não tiver token/chat_id, deixa True mesmo (o código falha silencioso)
+# Tokens ficam em ENV: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 
-# ─────────────────────────────
-# Helpers robustos de ENV (não crasham)
-# ─────────────────────────────
-def env_str(name: str, default: str = "") -> str:
-    try:
-        v = os.getenv(name)
-        return v.strip() if v is not None else default
-    except Exception:
-        return default
+# Radar
+RADAR_ENABLED = True
+SCAN_EVERY_SECONDS = 60  # “alertas o tempo todo” = scaneia a cada 1 minuto
 
-def env_int(name: str, default: int = 0) -> int:
-    try:
-        v = os.getenv(name)
-        if v is None:
-            return default
-        v = v.strip()
-        if not v:
-            return default
-        return int(v)
-    except Exception:
-        return default
-
-def env_bool(name: str, default: bool = False) -> bool:
-    try:
-        v = os.getenv(name)
-        if v is None:
-            return default
-        v = v.strip().lower()
-        return v in ("1", "true", "yes", "y", "on")
-    except Exception:
-        return default
-
-# ─────────────────────────────
-# Trading V2 (safe defaults)
-# ─────────────────────────────
-TRADING_ENABLED = env_bool("TRADING_ENABLED", True)
-
-# se você não setar agora, fica 0 e o bot NÃO tenta postar no canal
-TRADING_CHANNEL_ID = env_int("TRADING_CHANNEL_ID", 0)
-
-# se TRADING_CHANNEL_ID = 0, a restrição fica "flexível" (não trava comandos)
-TRADING_CHANNEL_ONLY = env_bool("TRADING_CHANNEL_ONLY", True)
-
-# Trading News
-TRADING_NEWS_ATIVAS = env_bool("TRADING_NEWS_ATIVAS", False)
-TRADING_NEWS_TIMES = env_str("TRADING_NEWS_TIMES", "08:00,14:00,20:00")
-
-# Resumo diário
-TRADING_DAILY_SUMMARY_ATIVO = env_bool("TRADING_DAILY_SUMMARY_ATIVO", False)
-TRADING_DAILY_SUMMARY_TIME = env_str("TRADING_DAILY_SUMMARY_TIME", "21:00")
-
-# ─────────────────────────────
-# SINAIS (SPOT + FUTURES) — v1 (educacional)
-# ─────────────────────────────
-
-# IDs dos canais (OBRIGATÓRIO)
-CANAL_SINAIS_SPOT = 1468294566024052800        # coloque o ID do canal #sinais-spot
-CANAL_SINAIS_FUTURES = 1468461753431228457     # coloque o ID do canal #sinais-futures
-
-# Liga/desliga
-SINAIS_ATIVOS = True
-
-# A cada quantos minutos varrer o mercado
-SINAIS_SCAN_MINUTES = 5
-
-# Timeframe analisado (15m recomendado)
-SINAIS_TIMEFRAME = "15m"
-
-# Pares monitorados (começa pequeno pra não rate-limitar)
-SINAIS_PARES = [
+# Watchlist SPOT (Binance symbols)
+WATCHLIST = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
@@ -114,12 +29,34 @@ SINAIS_PARES = [
     "XRPUSDT",
 ]
 
-# Exchanges a consultar (você pode reduzir pra ["binance"] se quiser)
-SINAIS_EXCHANGES = ["binance", "mexc"]
+# ─────────────────────────────
+# Regras de alerta (SPOT)
+# ─────────────────────────────
+# 1) Spike 5m: variação percentual em 5 minutos
+SPIKE_5M_DEFAULT_PCT = 0.80  # padrão
+SPIKE_5M_PCT = {             # overrides por ativo (opcional)
+    "BTCUSDT": 0.60,
+    "ETHUSDT": 0.75,
+}
 
-# Cooldown por sinal (evita spam repetido)
-SINAIS_COOLDOWN_MINUTES = 60
+# 2) Breakout/Breakdown 15m (rompe máxima/mínima 20 candles) + volume
+BREAK_15M_LOOKBACK = 20
+BREAK_15M_VOL_MULT = 1.30
 
-# Limites anti-spam por ciclo
-SINAIS_MAX_POR_CICLO_SPOT = 8
-SINAIS_MAX_POR_CICLO_FUTURES = 8
+# 3) Tendência 15m (EMA9 x EMA21 cross)
+EMA_FAST = 9
+EMA_SLOW = 21
+
+# Anti-spam
+MAX_ALERTS_PER_CYCLE = 5
+
+COOLDOWN_MINUTES = {
+    "SPIKE_5M": 10,
+    "BREAKOUT_15M": 45,
+    "BREAKDOWN_15M": 45,
+    "EMA_CROSS_15M": 60,
+}
+
+# Pulso (mensagem “profissional” recorrente com o que observar)
+PULSE_ENABLED = True
+PULSE_TIMES_BRT = ["06:05", "12:05", "18:05", "22:05"]  # horários Brasil
