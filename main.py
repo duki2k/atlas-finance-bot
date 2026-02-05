@@ -14,7 +14,7 @@ import config
 from notifier import Notifier
 from binance_spot import BinanceSpot
 from yahoo_data import YahooData
-from engines_binance import BinanceDipEngine
+from engines_binance import BinanceMentorEngine
 from engines_binomo import BinomoEngine
 from news_engine import NewsEngine
 
@@ -31,7 +31,7 @@ notifier: Notifier | None = None
 binance: BinanceSpot | None = None
 yahoo: YahooData | None = None
 
-engine_binance = BinanceDipEngine()
+engine_binance = BinanceMentorEngine()
 engine_binomo = BinomoEngine()
 engine_news = NewsEngine()
 
@@ -41,6 +41,8 @@ ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
 _last_member_minute = None
 _last_invest_minute = None
 _last_news_minute = None
+_last_binance_hour_member = None
+_last_binance_hour_invest = None
 
 
 class AtlasClient(discord.Client):
@@ -107,6 +109,11 @@ def _should_run_news(now: datetime) -> bool:
     return (now.minute % every) == 0
 
 
+def _should_run_binance_invest_hourly(now: datetime) -> bool:
+    # 1x por hora no minuto 00
+    return now.minute == 0
+
+
 def _test_embed(title: str, note: str) -> discord.Embed:
     now = _now_brt().strftime("%d/%m/%Y %H:%M")
     e = discord.Embed(
@@ -142,12 +149,52 @@ async def _send_or_fail(channel_id: int, embed: discord.Embed, role_ping: int = 
 
 
 # ─────────────────────────────
-# LOOPS AUTOMÁTICOS (1x/min)
+# LOOP BINANCE MENTOR (INV: 1x/h, MEMBRO: horários grade)
+# ─────────────────────────────
+@tasks.loop(minutes=1)
+async def loop_binance_mentor():
+    global _last_binance_hour_member, _last_binance_hour_invest
+    if notifier is None or binance is None:
+        return
+
+    now = _now_brt()
+    hour_key = now.strftime("%Y-%m-%d %H")
+
+    async with LOCK:
+        # INVESTIDOR: 1x/h
+        if _should_run_binance_invest_hourly(now) and _last_binance_hour_invest != hour_key:
+            picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(picks, tier="investidor")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_MENTOR_INV")
+            if not ok:
+                await log(f"Falha envio BINANCE_MENTOR_INV: {err}")
+            _last_binance_hour_invest = hour_key
+            await log(f"BINANCE MENTOR INVEST OK {hour_key}")
+
+        # MEMBRO: segue a grade (4/dia normalmente)
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        if _should_run_member(now) and _last_binance_hour_member != minute_key:
+            picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(picks, tier="membro")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "BINANCE_MENTOR_MEMBRO")
+            if not ok:
+                await log(f"Falha envio BINANCE_MENTOR_MEMBRO: {err}")
+            _last_binance_hour_member = minute_key
+            await log(f"BINANCE MENTOR MEMBRO OK {minute_key}")
+
+
+@loop_binance_mentor.error
+async def loop_binance_mentor_error(err: Exception):
+    await log(f"ERRO loop_binance_mentor: {err}")
+
+
+# ─────────────────────────────
+# LOOP BINOMO (TRADING)
 # ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_member():
     global _last_member_minute
-    if notifier is None or binance is None or yahoo is None:
+    if notifier is None or yahoo is None:
         return
 
     now = _now_brt()
@@ -163,14 +210,7 @@ async def loop_member():
     _last_member_minute = minute_key
 
     async with LOCK:
-        # BINANCE MEMBRO
-        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-        emb = engine_binance.build_embed(dips, tier="membro")
-        ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "BINANCE_MEMBRO")
-        if not ok:
-            await log(f"Falha envio BINANCE_MEMBRO: {err}")
-
-        # BINOMO MEMBRO (15m) — se não gerar, não manda (pra manter 4/dia)
+        # Binomo membro: 15m (menos spam, mais seletivo)
         entries = []
         e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
         if e15:
@@ -182,7 +222,7 @@ async def loop_member():
         else:
             await log("MEMBRO BINOMO: sem entrada (ou mercado fechado).")
 
-        await log(f"MEMBRO OK {minute_key}")
+        await log(f"MEMBRO BINOMO OK {minute_key}")
 
 
 @loop_member.error
@@ -193,7 +233,7 @@ async def loop_member_error(err: Exception):
 @tasks.loop(minutes=1)
 async def loop_investidor():
     global _last_invest_minute
-    if notifier is None or binance is None or yahoo is None:
+    if notifier is None or yahoo is None:
         return
 
     now = _now_brt()
@@ -209,14 +249,7 @@ async def loop_investidor():
     _last_invest_minute = minute_key
 
     async with LOCK:
-        # BINANCE INVESTIDOR
-        dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-        emb = engine_binance.build_embed(dips, tier="investidor")
-        ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV")
-        if not ok:
-            await log(f"Falha envio BINANCE_INV: {err}")
-
-        # BINOMO INVESTIDOR (1m/5m/15m)
+        # Binomo investidor: 1m/5m/15m (trading)
         entries = []
         for tf in ("1m", "5m", "15m"):
             e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
@@ -229,13 +262,12 @@ async def loop_investidor():
             if not ok2:
                 await log(f"Falha envio BINOMO_INV: {err2}")
         else:
-            # “bolsa fechada”: fim de semana → loga e não manda
             if datetime.utcnow().weekday() >= 5:
                 await log("INV BINOMO: mercado fechado (fim de semana). Sem envio.")
             else:
                 await log("INV BINOMO: sem entradas válidas.")
 
-        await log(f"INV OK {minute_key}")
+        await log(f"INV BINOMO OK {minute_key}")
 
 
 @loop_investidor.error
@@ -243,10 +275,13 @@ async def loop_investidor_error(err: Exception):
     await log(f"ERRO loop_investidor: {err}")
 
 
+# ─────────────────────────────
+# LOOP NEWS (PT=tradução do EN base)
+# ─────────────────────────────
 @tasks.loop(minutes=1)
 async def loop_news():
     global _last_news_minute
-    if notifier is None:
+    if notifier is None or HTTP is None:
         return
 
     now = _now_brt()
@@ -260,11 +295,10 @@ async def loop_news():
 
     _last_news_minute = minute_key
 
-    # news_engine final retorna (pt, en)
-    pt, en = engine_news.fetch()
-    engine_news.mark_seen(pt + en)
-    emb = engine_news.build_embed(pt, en)
+    pt, en, sources, translated_ok = await engine_news.fetch(HTTP)
+    engine_news.mark_seen(en)
 
+    emb = engine_news.build_embed(pt, en, sources, translated_ok)
     ok, err = await _send_or_fail(int(config.CANAL_NEWS_CRIPTO), emb, 0, "NEWS")
     if not ok:
         await log(f"Falha envio NEWS: {err}")
@@ -301,61 +335,11 @@ async def resync(interaction: discord.Interaction):
     await interaction.followup.send("✅ Sync solicitado. Veja o CANAL_LOGS.", ephemeral=True)
 
 
-@client.tree.command(name="force_investidor", description="Força envio INVESTIDOR (Binance+Binomo) (Admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def force_investidor(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if notifier is None or binance is None or yahoo is None:
-        await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
-        return
-
-    results = []
-    fails = []
-
-    async with LOCK:
-        # Binance investidor sempre envia (mesmo sem dips)
-        try:
-            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-            emb = engine_binance.build_embed(dips, tier="investidor")
-            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV_FORCE")
-            if ok:
-                results.append("✅ Binance INVESTIDOR")
-            else:
-                fails.append(f"❌ Binance INVESTIDOR ({err})")
-        except Exception as e:
-            fails.append(f"❌ Binance INVESTIDOR ({e})")
-
-        # Binomo investidor — se não gerar, manda embed TESTE (pra validar canal)
-        try:
-            entries = []
-            for tf in ("1m", "5m", "15m"):
-                e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
-                if e:
-                    entries.append(e)
-
-            if entries:
-                emb2 = engine_binomo.build_embed(entries, tier="investidor")
-            else:
-                emb2 = _test_embed("Binomo INVESTIDOR", "Sem entrada no momento — este embed confirma que o canal está OK ✅")
-
-            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb2, int(config.ROLE_INVESTIDOR_ID or 0), "BINOMO_INV_FORCE")
-            if ok2:
-                results.append("✅ Binomo INVESTIDOR")
-            else:
-                fails.append(f"❌ Binomo INVESTIDOR ({err2})")
-        except Exception as e:
-            fails.append(f"❌ Binomo INVESTIDOR ({e})")
-
-    await log(f"FORCE_INVESTIDOR por {interaction.user} -> {results} / {fails}")
-    msg = "\n".join(results + ([""] + fails if fails else []))
-    await interaction.followup.send("📨 **Force Investidor concluído:**\n" + msg, ephemeral=True)
-
-
 @client.tree.command(name="force_all", description="Força envio em TODOS os canais (Admin)")
 @app_commands.checks.has_permissions(administrator=True)
 async def force_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    if notifier is None or binance is None or yahoo is None:
+    if notifier is None or binance is None or yahoo is None or HTTP is None:
         await interaction.followup.send("❌ Bot ainda iniciando.", ephemeral=True)
         return
 
@@ -363,76 +347,58 @@ async def force_all(interaction: discord.Interaction):
     fails = []
 
     async with LOCK:
-        # ── BINANCE MEMBRO
+        # Binance mentor membro
         try:
-            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-            emb = engine_binance.build_embed(dips, tier="membro")
-            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "BINANCE_MEMBRO_FORCE")
-            if ok: results.append("✅ Binance MEMBRO")
-            else:  fails.append(f"❌ Binance MEMBRO ({err})")
+            picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(picks, tier="membro") if picks else _test_embed("Binance MEMBRO", "Sem picks — teste OK ✅")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_MEMBRO), emb, int(config.ROLE_MEMBRO_ID or 0), "FORCE_BINANCE_MEMBRO")
+            results.append("✅ Binance MEMBRO" if ok else f"❌ Binance MEMBRO ({err})")
         except Exception as e:
             fails.append(f"❌ Binance MEMBRO ({e})")
 
-        # ── BINANCE INVESTIDOR
+        # Binance mentor investidor
         try:
-            dips = await engine_binance.scan(binance, list(config.BINANCE_SYMBOLS))
-            emb = engine_binance.build_embed(dips, tier="investidor")
-            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "BINANCE_INV_FORCEALL")
-            if ok: results.append("✅ Binance INVESTIDOR")
-            else:  fails.append(f"❌ Binance INVESTIDOR ({err})")
+            picks = await engine_binance.scan_1h(binance, list(config.BINANCE_SYMBOLS))
+            emb = engine_binance.build_embed(picks, tier="investidor") if picks else _test_embed("Binance INVESTIDOR", "Sem picks — teste OK ✅")
+            ok, err = await _send_or_fail(int(config.CANAL_BINANCE_INVESTIDOR), emb, int(config.ROLE_INVESTIDOR_ID or 0), "FORCE_BINANCE_INV")
+            results.append("✅ Binance INVESTIDOR" if ok else f"❌ Binance INVESTIDOR ({err})")
         except Exception as e:
             fails.append(f"❌ Binance INVESTIDOR ({e})")
 
-        # ── BINOMO MEMBRO (se não gerar, manda teste)
+        # Binomo membro (15m)
         try:
             entries = []
             e15 = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), "15m")
             if e15:
                 entries.append(e15)
-
-            emb2 = engine_binomo.build_embed(entries, tier="membro") if entries else _test_embed(
-                "Binomo MEMBRO",
-                "Sem entrada no momento — este embed confirma que o canal está OK ✅"
-            )
-
-            ok2, err2 = await _send_or_fail(int(config.CANAL_BINOMO_MEMBRO), emb2, int(config.ROLE_MEMBRO_ID or 0), "BINOMO_MEMBRO_FORCE")
-            if ok2: results.append("✅ Binomo MEMBRO")
-            else:  fails.append(f"❌ Binomo MEMBRO ({err2})")
+                emb2 = engine_binomo.build_embed(entries, tier="membro")
+            else:
+                emb2 = _test_embed("Binomo MEMBRO", "Sem entrada — teste OK ✅")
+            ok, err = await _send_or_fail(int(config.CANAL_BINOMO_MEMBRO), emb2, int(config.ROLE_MEMBRO_ID or 0), "FORCE_BINOMO_MEMBRO")
+            results.append("✅ Binomo MEMBRO" if ok else f"❌ Binomo MEMBRO ({err})")
         except Exception as e:
             fails.append(f"❌ Binomo MEMBRO ({e})")
 
-        # ── BINOMO INVESTIDOR (se não gerar, manda teste)
+        # Binomo investidor (1m/5m/15m)
         try:
             entries = []
             for tf in ("1m", "5m", "15m"):
                 e = await engine_binomo.scan_timeframe(yahoo, list(config.BINOMO_TICKERS), tf)
                 if e:
                     entries.append(e)
-
-            emb3 = engine_binomo.build_embed(entries, tier="investidor") if entries else _test_embed(
-                "Binomo INVESTIDOR",
-                "Sem entrada no momento — este embed confirma que o canal está OK ✅"
-            )
-
-            ok3, err3 = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb3, int(config.ROLE_INVESTIDOR_ID or 0), "BINOMO_INV_FORCEALL")
-            if ok3: results.append("✅ Binomo INVESTIDOR")
-            else:  fails.append(f"❌ Binomo INVESTIDOR ({err3})")
+            emb3 = engine_binomo.build_embed(entries, tier="investidor") if entries else _test_embed("Binomo INVESTIDOR", "Sem entrada — teste OK ✅")
+            ok, err = await _send_or_fail(int(config.CANAL_BINOMO_INVESTIDOR), emb3, int(config.ROLE_INVESTIDOR_ID or 0), "FORCE_BINOMO_INV")
+            results.append("✅ Binomo INVESTIDOR" if ok else f"❌ Binomo INVESTIDOR ({err})")
         except Exception as e:
             fails.append(f"❌ Binomo INVESTIDOR ({e})")
 
-        # ── NEWS (se não tiver item, manda “teste ok” também)
+        # News PT/EN (mesma notícia traduzida)
         try:
-            pt, en = engine_news.fetch()
-            engine_news.mark_seen(pt + en)
-
-            embn = engine_news.build_embed(pt, en) if (pt or en) else _test_embed(
-                "NEWS",
-                "Sem notícias novas agora — este embed confirma que o canal NEWS está OK ✅"
-            )
-
-            okn, errn = await _send_or_fail(int(config.CANAL_NEWS_CRIPTO), embn, 0, "NEWS_FORCEALL")
-            if okn: results.append("✅ NEWS")
-            else:   fails.append(f"❌ NEWS ({errn})")
+            pt, en, sources, translated_ok = await engine_news.fetch(HTTP)
+            engine_news.mark_seen(en)
+            embn = engine_news.build_embed(pt, en, sources, translated_ok) if (pt or en) else _test_embed("NEWS", "Sem news — teste OK ✅")
+            ok, err = await _send_or_fail(int(config.CANAL_NEWS_CRIPTO), embn, 0, "FORCE_NEWS")
+            results.append("✅ NEWS" if ok else f"❌ NEWS ({err})")
         except Exception as e:
             fails.append(f"❌ NEWS ({e})")
 
@@ -462,6 +428,8 @@ async def on_ready():
     if SYNC_COMMANDS:
         await sync_commands()
 
+    if not loop_binance_mentor.is_running():
+        loop_binance_mentor.start()
     if not loop_member.is_running():
         loop_member.start()
     if not loop_investidor.is_running():
@@ -469,19 +437,16 @@ async def on_ready():
     if not loop_news.is_running():
         loop_news.start()
 
-    await log("Loops iniciados (member/invest/news).")
+    await log("Loops iniciados (binance_mentor/member/invest/news).")
 
 
 async def shutdown(reason: str):
     await log(f"Shutdown: {reason}")
 
     with contextlib.suppress(Exception):
-        if loop_member.is_running():
-            loop_member.cancel()
-        if loop_investidor.is_running():
-            loop_investidor.cancel()
-        if loop_news.is_running():
-            loop_news.cancel()
+        for t in (loop_binance_mentor, loop_member, loop_investidor, loop_news):
+            if t.is_running():
+                t.cancel()
 
     global HTTP
     with contextlib.suppress(Exception):
