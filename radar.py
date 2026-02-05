@@ -1,32 +1,36 @@
-# radar.py (Atlas Radar v3 - SPOT)
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-import math
+
 import pytz
 import discord
-
 import config
-from binance_spot import BinanceSpot
-from notifier import Notifier
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 @dataclass
-class Alert:
-    kind: str
+class Signal:
+    tier: str               # "membro" | "investidor"
+    interval: str           # "1m" | "5m" | "15m" | "4h"
+    kind: str               # "SPIKE" | "BREAK" | "EMA"
     symbol: str
-    direction: str  # "COMPRA" ou "VENDA" (spot venda = reduzir/realizar/proteger)
+    side: str               # "COMPRA" | "VENDA" (spot venda = reduzir/proteger)
     price: float
-    change_pct: float
-    volume_mult: Optional[float]
-    level: Optional[float]
-    entry_minute: int
-    entry_time_str: str
+
+    entry: float
+    stop: float
+    tp1: float
+    tp2: float
+
+    risk_pct: float
+    tp1_pct: float
+    tp2_pct: float
+
     why: str
-    playbook: str
     score: float
+    next_time_str: str
+    next_minute: int
 
 def ema(values: List[float], period: int) -> Optional[float]:
     if len(values) < period:
@@ -37,6 +41,19 @@ def ema(values: List[float], period: int) -> Optional[float]:
         e = v * k + e * (1 - k)
     return e
 
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 2:
+        return None
+    trs = []
+    for i in range(1, n):
+        h = highs[i]; l = lows[i]; pc = closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
 def _fmt_price(p: float) -> str:
     if p >= 1000:
         return f"{p:,.2f}"
@@ -44,36 +61,42 @@ def _fmt_price(p: float) -> str:
         return f"{p:,.4f}"
     return f"{p:,.6f}"
 
-def _next_slot(now: datetime, step_minutes: int) -> Tuple[datetime, int]:
-    minute = now.minute
-    next_min = ((minute // step_minutes) + 1) * step_minutes
-    base = now.replace(second=0, microsecond=0)
-    if next_min >= 60:
-        base = base.replace(minute=0) + timedelta(hours=1)
-        return base, 0
-    return base.replace(minute=next_min), next_min
+def _next_slot(now: datetime, interval: str) -> Tuple[datetime, int]:
+    now = now.replace(second=0, microsecond=0)
+    if interval == "1m":
+        nxt = now + timedelta(minutes=1)
+        return nxt, nxt.minute
+    if interval == "5m":
+        m = now.minute
+        nm = ((m // 5) + 1) * 5
+        if nm >= 60:
+            nxt = now.replace(minute=0) + timedelta(hours=1)
+            return nxt, 0
+        nxt = now.replace(minute=nm)
+        return nxt, nm
+    if interval == "15m":
+        m = now.minute
+        nm = ((m // 15) + 1) * 15
+        if nm >= 60:
+            nxt = now.replace(minute=0) + timedelta(hours=1)
+            return nxt, 0
+        nxt = now.replace(minute=nm)
+        return nxt, nm
+    # 4h
+    nxt = now + timedelta(hours=4)
+    nxt = nxt.replace(minute=0)
+    return nxt, 0
 
-def _vol_mult(vols: List[float], lookback: int = 20) -> Optional[float]:
-    if len(vols) < lookback + 2:
-        return None
-    v_now = vols[-1]
-    base = vols[-(lookback+1):-1]
-    avg = sum(base) / len(base) if base else 0.0
-    if avg <= 0:
-        return None
-    return v_now / avg
-
-def _cooldown_key(a: Alert) -> Tuple[str, str]:
-    return (a.kind, a.symbol)
+def _cooldown_minutes(tier: str, interval: str, kind: str) -> int:
+    return int(config.COOLDOWN_MINUTES.get((tier, interval, kind), 30))
 
 class RadarEngine:
     def __init__(self):
-        self.last_sent: Dict[Tuple[str, str], float] = {}
-        self.paused_until_ts: float = 0.0
-        self.last_cycle_brt: str = ""
+        self.last_sent: Dict[Tuple[str, str, str, str], float] = {}
+        self.paused_until_ts = 0.0
 
     def paused(self) -> bool:
-        return (datetime.now(BR_TZ).timestamp() < self.paused_until_ts)
+        return datetime.now(BR_TZ).timestamp() < self.paused_until_ts
 
     def pause_minutes(self, minutes: int):
         self.paused_until_ts = (datetime.now(BR_TZ) + timedelta(minutes=minutes)).timestamp()
@@ -81,234 +104,188 @@ class RadarEngine:
     def resume(self):
         self.paused_until_ts = 0.0
 
-    def _can_send(self, alert: Alert) -> bool:
-        cd = int(config.COOLDOWN_MINUTES.get(alert.kind, 30))
-        key = _cooldown_key(alert)
+    def _can_send(self, s: Signal) -> bool:
+        key = (s.tier, s.interval, s.kind, s.symbol)
         now_ts = datetime.now(BR_TZ).timestamp()
         last = self.last_sent.get(key, 0.0)
-        if (now_ts - last) < (cd * 60):
+        cd = _cooldown_minutes(s.tier, s.interval, s.kind)
+        if (now_ts - last) < cd * 60:
             return False
         self.last_sent[key] = now_ts
         return True
 
+    def _plan(self, side: str, price: float, a: float) -> Tuple[float, float, float, float, float, float, float]:
+        # entrada no próximo candle no preço/nível (educacional)
+        entry = price
+        risk = (1.2 * a) if a and a > 0 else price * 0.005  # fallback 0.5%
+
+        if side == "COMPRA":
+            stop = entry - risk
+            tp1 = entry + risk
+            tp2 = entry + 2 * risk
+        else:
+            # spot: “VENDA” = reduzir/realizar/proteger; stop acima
+            stop = entry + risk
+            tp1 = entry - risk
+            tp2 = entry - 2 * risk
+
+        risk_pct = abs((entry - stop) / entry) * 100.0
+        tp1_pct = abs((tp1 - entry) / entry) * 100.0
+        tp2_pct = abs((tp2 - entry) / entry) * 100.0
+        return entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct
+
     def _score(self, kind: str, abs_pct: float, vol_mult: Optional[float]) -> float:
-        base = {"SPIKE_5M": 70, "BREAKOUT_15M": 85, "BREAKDOWN_15M": 85, "EMA_CROSS_15M": 60}.get(kind, 50)
-        s = base + min(abs_pct, 5.0) * 8.0
+        base = {"SPIKE": 65, "BREAK": 85, "EMA": 60}.get(kind, 50)
+        s = base + min(abs_pct, 5.0) * 10.0
         if vol_mult is not None:
             s += min(vol_mult, 3.0) * 10.0
         return s
 
-    def _playbook(self, kind: str, direction: str) -> str:
-        # ✅ “o que fazer com o dinheiro” em formato de playbook (educacional)
-        if direction == "COMPRA":
-            return (
-                "✅ **Playbook (educacional):**\n"
-                "• Se você é investidor: evite FOMO; prefira **compras parceladas (DCA)**.\n"
-                "• Se você é trader: espere **confirmação/fechamento** e defina **stop**.\n"
-                "• Regra de risco: arrisque pouco por operação (ex.: **0.5%–1%** do capital)."
-            )
-        return (
-            "🛡️ **Playbook (educacional):**\n"
-            "• Em SPOT, **VENDA** geralmente = realizar lucro, reduzir exposição ou proteger caixa.\n"
-            "• Evite “comprar queda” no impulso; espere estrutura voltar.\n"
-            "• Se você tem posição: considere stops/realização parcial e rebalanceamento."
-        )
-
-    async def generate_alerts(self, b: BinanceSpot) -> List[Alert]:
-        now = datetime.now(BR_TZ)
-        alerts: List[Alert] = []
-
-        wl = list(getattr(config, "WATCHLIST", []))
-        if not wl:
-            return []
-
-        # compute entry times
-        slot15_dt, slot15_min = _next_slot(now, 15)
-        slot05_dt, slot05_min = _next_slot(now, 5)
-
-        for sym in wl:
-            # --- 5m spike from 1m klines (last 6 closes = 5 minutes delta)
-            t1, o1, h1, l1, c1, v1 = await b.klines(sym, "1m", 10)
-            if len(c1) >= 6:
-                prev = c1[-6]
-                last = c1[-1]
-                if prev > 0:
-                    chg5 = ((last - prev) / prev) * 100.0
-                    thr = float(config.SPIKE_5M_PCT.get(sym, config.SPIKE_5M_DEFAULT_PCT))
-                    if abs(chg5) >= thr:
-                        direction = "COMPRA" if chg5 > 0 else "VENDA"
-                        score = self._score("SPIKE_5M", abs(chg5), None)
-                        alerts.append(Alert(
-                            kind="SPIKE_5M",
-                            symbol=sym,
-                            direction=direction,
-                            price=last,
-                            change_pct=chg5,
-                            volume_mult=None,
-                            level=None,
-                            entry_minute=slot05_min,
-                            entry_time_str=slot05_dt.strftime("%H:%M"),
-                            why=f"Movimento rápido em **5m**: {chg5:+.2f}%",
-                            playbook=self._playbook("SPIKE_5M", direction),
-                            score=score,
-                        ))
-
-            # --- 15m breakout/breakdown + EMA cross
-            t15, o15, h15, l15, c15, v15 = await b.klines(sym, "15m", 80)
-            if len(c15) < 30:
-                continue
-
-            last = c15[-1]
-            prev = c15[-2]
-            chg15 = ((last - prev) / prev) * 100.0 if prev > 0 else 0.0
-            vm = _vol_mult(v15, lookback=int(config.BREAK_15M_LOOKBACK))
-
-            # levels
-            lb = int(config.BREAK_15M_LOOKBACK)
-            if len(h15) >= lb + 2 and len(l15) >= lb + 2:
-                hi = max(h15[-(lb+1):-1])
-                lo = min(l15[-(lb+1):-1])
-
-                if last > hi and (vm is None or vm >= float(config.BREAK_15M_VOL_MULT)):
-                    direction = "COMPRA"
-                    score = self._score("BREAKOUT_15M", abs(chg15), vm)
-                    alerts.append(Alert(
-                        kind="BREAKOUT_15M",
-                        symbol=sym,
-                        direction=direction,
-                        price=last,
-                        change_pct=chg15,
-                        volume_mult=vm,
-                        level=hi,
-                        entry_minute=slot15_min,
-                        entry_time_str=slot15_dt.strftime("%H:%M"),
-                        why=f"Breakout **15m** acima da máxima {lb}c + volume.",
-                        playbook=self._playbook("BREAKOUT_15M", direction),
-                        score=score,
-                    ))
-
-                if last < lo and (vm is None or vm >= float(config.BREAK_15M_VOL_MULT)):
-                    direction = "VENDA"
-                    score = self._score("BREAKDOWN_15M", abs(chg15), vm)
-                    alerts.append(Alert(
-                        kind="BREAKDOWN_15M",
-                        symbol=sym,
-                        direction=direction,
-                        price=last,
-                        change_pct=chg15,
-                        volume_mult=vm,
-                        level=lo,
-                        entry_minute=slot15_min,
-                        entry_time_str=slot15_dt.strftime("%H:%M"),
-                        why=f"Breakdown **15m** abaixo da mínima {lb}c + volume.",
-                        playbook=self._playbook("BREAKDOWN_15M", direction),
-                        score=score,
-                    ))
-
-            # EMA cross 15m
-            fast = ema(c15[-60:], int(config.EMA_FAST))
-            slow = ema(c15[-60:], int(config.EMA_SLOW))
-            fast_prev = ema(c15[-61:-1], int(config.EMA_FAST)) if len(c15) >= 61 else None
-            slow_prev = ema(c15[-61:-1], int(config.EMA_SLOW)) if len(c15) >= 61 else None
-
-            if None not in (fast, slow, fast_prev, slow_prev):
-                if fast_prev <= slow_prev and fast > slow:
-                    direction = "COMPRA"
-                    score = self._score("EMA_CROSS_15M", abs(chg15), vm)
-                    alerts.append(Alert(
-                        kind="EMA_CROSS_15M",
-                        symbol=sym,
-                        direction=direction,
-                        price=last,
-                        change_pct=chg15,
-                        volume_mult=vm,
-                        level=None,
-                        entry_minute=slot15_min,
-                        entry_time_str=slot15_dt.strftime("%H:%M"),
-                        why="Cruzamento de tendência **15m** (EMA9 ↑ EMA21).",
-                        playbook=self._playbook("EMA_CROSS_15M", direction),
-                        score=score,
-                    ))
-                elif fast_prev >= slow_prev and fast < slow:
-                    # em SPOT isso vira alerta de proteção/realização (VENDA)
-                    direction = "VENDA"
-                    score = self._score("EMA_CROSS_15M", abs(chg15), vm)
-                    alerts.append(Alert(
-                        kind="EMA_CROSS_15M",
-                        symbol=sym,
-                        direction=direction,
-                        price=last,
-                        change_pct=chg15,
-                        volume_mult=vm,
-                        level=None,
-                        entry_minute=slot15_min,
-                        entry_time_str=slot15_dt.strftime("%H:%M"),
-                        why="Cruzamento de tendência **15m** (EMA9 ↓ EMA21).",
-                        playbook=self._playbook("EMA_CROSS_15M", direction),
-                        score=score,
-                    ))
-
-        # escolhe os melhores do ciclo (profissional = menos ruído)
-        alerts.sort(key=lambda a: a.score, reverse=True)
-        return alerts[: int(config.MAX_ALERTS_PER_CYCLE)]
-
-    def build_embed(self, a: Alert) -> discord.Embed:
-        color = 0x2ECC71 if a.direction == "COMPRA" else 0xE74C3C
-        title = f"🚨 Atlas Radar — {a.direction} (SPOT)"
+    def build_embed(self, s: Signal) -> discord.Embed:
+        color = 0x2ECC71 if s.side == "COMPRA" else 0xE74C3C
+        title = f"🚨 Entrada {s.interval} — {s.side} (SPOT)"
         desc = (
-            f"**Ativo:** `{a.symbol}`\n"
-            f"**Motivo:** {a.why}\n\n"
+            f"**Ativo:** `{s.symbol}`\n"
+            f"**Motivo:** {s.why}\n"
+            f"**Camada:** `{s.tier.upper()}`\n\n"
             "🧠 Educacional — não é recomendação financeira."
         )
         e = discord.Embed(title=title, description=desc, color=color)
-        e.add_field(name="💲 Preço", value=_fmt_price(a.price), inline=True)
-        e.add_field(name="📈 Variação", value=f"{a.change_pct:+.2f}% (15m)", inline=True)
-
-        if a.level is not None:
-            e.add_field(name="🎯 Nível", value=_fmt_price(a.level), inline=True)
-
-        vm = f"{a.volume_mult:.2f}x" if a.volume_mult is not None else "—"
-        e.add_field(name="📊 Volume", value=vm, inline=True)
-
+        e.add_field(name="💲 Preço", value=_fmt_price(s.price), inline=True)
+        e.add_field(name="🎯 Entrada", value=_fmt_price(s.entry), inline=True)
+        e.add_field(name="🛡️ Stop", value=f"{_fmt_price(s.stop)}\nRisco: **{s.risk_pct:.2f}%**", inline=True)
         e.add_field(
-            name="⏱️ Minuto de entrada",
-            value=f"Próxima confirmação em **{a.entry_time_str} BRT** (minuto **{a.entry_minute:02d}**).",
+            name="🏁 Alvos",
+            value=f"TP1: {_fmt_price(s.tp1)} (**{s.tp1_pct:.2f}%**)\nTP2: {_fmt_price(s.tp2)} (**{s.tp2_pct:.2f}%**)",
             inline=False,
         )
-        e.add_field(name="🧭 O que fazer", value=a.playbook, inline=False)
-        e.set_footer(text=f"Atlas Radar • {datetime.now(BR_TZ).strftime('%d/%m/%Y %H:%M')} BRT")
+        e.add_field(
+            name="⏱️ Minuto de entrada",
+            value=f"Próximo candle: **{s.next_time_str} BRT** (minuto **{s.next_minute:02d}**)",
+            inline=False,
+        )
+        e.set_footer(text=f"Atlas Radar Pro • {datetime.now(BR_TZ).strftime('%d/%m/%Y %H:%M')} BRT")
         return e
 
-    def build_telegram_text(self, a: Alert) -> str:
-        vm = f"{a.volume_mult:.2f}x" if a.volume_mult is not None else "-"
-        level = _fmt_price(a.level) if a.level is not None else "-"
+    def build_telegram(self, s: Signal) -> str:
         return (
-            f"🚨 Atlas Radar (SPOT) — {a.direction}\n"
-            f"Ativo: {a.symbol}\n"
-            f"Preço: {_fmt_price(a.price)}\n"
-            f"Variação (15m): {a.change_pct:+.2f}%\n"
-            f"Nível: {level}\n"
-            f"Volume: {vm}\n"
-            f"Motivo: {a.why}\n"
-            f"Entrada: próxima confirmação {a.entry_time_str} BRT (min {a.entry_minute:02d})\n\n"
-            f"{a.playbook}\n\n"
+            f"🚨 Atlas Radar Pro — {s.side} (SPOT) [{s.interval}] / {s.tier.upper()}\n"
+            f"Ativo: {s.symbol}\n"
+            f"Preço: {_fmt_price(s.price)}\n"
+            f"Entrada: {_fmt_price(s.entry)}\n"
+            f"Stop: {_fmt_price(s.stop)} (risco {s.risk_pct:.2f}%)\n"
+            f"TP1: {_fmt_price(s.tp1)} ({s.tp1_pct:.2f}%)\n"
+            f"TP2: {_fmt_price(s.tp2)} ({s.tp2_pct:.2f}%)\n"
+            f"Minuto: {s.next_time_str} BRT\n"
+            f"Motivo: {s.why}\n\n"
             "Educacional — não é recomendação financeira."
         )
 
-    async def run_cycle(self, b: BinanceSpot, n: Notifier, force: bool = False) -> Tuple[int, int]:
-        if not getattr(config, "RADAR_ENABLED", False):
-            return (0, 0)
-        if self.paused() and not force:
-            return (0, 0)
+    async def scan(self, b, tier: str, interval: str, symbols: List[str]) -> List[Signal]:
+        rule = config.RULES[interval]
+        lookback = int(rule["lookback"])
+        atr_period = int(rule["atr_period"])
+        vol_mult_thr = float(rule["vol_mult"])
 
-        alerts = await self.generate_alerts(b)
-        sent = 0
+        now = datetime.now(BR_TZ)
+        nxt_dt, nxt_min = _next_slot(now, interval)
 
-        for a in alerts:
-            if force or self._can_send(a):
-                emb = self.build_embed(a)
-                await n.send_discord_alert(emb)
-                await n.send_telegram(self.build_telegram_text(a))
-                sent += 1
+        out: List[Signal] = []
 
-        return (sent, len(alerts))
+        # limite mínimo de candles para indicadores
+        limit = max(lookback + 5, 60) if interval in ("1m", "5m", "15m") else max(lookback + 5, 120)
+
+        for sym in symbols:
+            t, o, h, l, c, v = await b.klines(sym, interval, limit)
+            if len(c) < lookback + 5:
+                continue
+
+            price = c[-1]
+            prev = c[-2]
+            chg = ((price - prev) / prev) * 100.0 if prev > 0 else 0.0
+            abs_chg = abs(chg)
+
+            a = atr(h, l, c, atr_period) or 0.0
+
+            # volume mult
+            vm = None
+            if len(v) >= lookback + 2:
+                base = v[-(lookback+1):-1]
+                avg = (sum(base) / len(base)) if base else 0.0
+                if avg > 0:
+                    vm = v[-1] / avg
+
+            # 1) SPIKE (interval específico)
+            spike_thr = float(config.SPIKE_PCT.get(interval, 999.0))
+            if abs_chg >= spike_thr:
+                side = "COMPRA" if chg > 0 else "VENDA"
+                entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
+                out.append(Signal(
+                    tier=tier, interval=interval, kind="SPIKE", symbol=sym, side=side, price=price,
+                    entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                    why=f"Movimento do candle {interval}: {chg:+.2f}%",
+                    score=self._score("SPIKE", abs_chg, vm),
+                    next_time_str=nxt_dt.strftime("%H:%M"),
+                    next_minute=nxt_min,
+                ))
+
+            # 2) BREAKOUT/BREAKDOWN (lookback)
+            hi = max(h[-(lookback+1):-1])
+            lo = min(l[-(lookback+1):-1])
+            if vm is None or vm >= vol_mult_thr:
+                if price > hi:
+                    side = "COMPRA"
+                    entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
+                    out.append(Signal(
+                        tier=tier, interval=interval, kind="BREAK", symbol=sym, side=side, price=price,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        why=f"Rompimento acima da máxima ({lookback} candles) + volume.",
+                        score=self._score("BREAK", abs_chg, vm) + 10,
+                        next_time_str=nxt_dt.strftime("%H:%M"),
+                        next_minute=nxt_min,
+                    ))
+                elif price < lo:
+                    side = "VENDA"
+                    entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
+                    out.append(Signal(
+                        tier=tier, interval=interval, kind="BREAK", symbol=sym, side=side, price=price,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        why=f"Perda abaixo da mínima ({lookback} candles) + volume.",
+                        score=self._score("BREAK", abs_chg, vm) + 10,
+                        next_time_str=nxt_dt.strftime("%H:%M"),
+                        next_minute=nxt_min,
+                    ))
+
+            # 3) EMA cross (tendência)
+            fast = ema(c[-60:], int(config.EMA_FAST))
+            slow = ema(c[-60:], int(config.EMA_SLOW))
+            fast_prev = ema(c[-61:-1], int(config.EMA_FAST)) if len(c) >= 61 else None
+            slow_prev = ema(c[-61:-1], int(config.EMA_SLOW)) if len(c) >= 61 else None
+
+            if None not in (fast, slow, fast_prev, slow_prev):
+                if fast_prev <= slow_prev and fast > slow:
+                    side = "COMPRA"
+                    entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
+                    out.append(Signal(
+                        tier=tier, interval=interval, kind="EMA", symbol=sym, side=side, price=price,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        why="Tendência virou pra cima (EMA9 ↑ EMA21).",
+                        score=self._score("EMA", abs_chg, vm),
+                        next_time_str=nxt_dt.strftime("%H:%M"),
+                        next_minute=nxt_min,
+                    ))
+                elif fast_prev >= slow_prev and fast < slow:
+                    side = "VENDA"
+                    entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, a)
+                    out.append(Signal(
+                        tier=tier, interval=interval, kind="EMA", symbol=sym, side=side, price=price,
+                        entry=entry, stop=stop, tp1=tp1, tp2=tp2, risk_pct=risk_pct, tp1_pct=tp1_pct, tp2_pct=tp2_pct,
+                        why="Tendência virou pra baixo (EMA9 ↓ EMA21) — em SPOT é proteção/realização.",
+                        score=self._score("EMA", abs_chg, vm),
+                        next_time_str=nxt_dt.strftime("%H:%M"),
+                        next_minute=nxt_min,
+                    ))
+
+        out.sort(key=lambda s: s.score, reverse=True)
+        limit_out = int(config.MAX_ALERTS_PER_CYCLE.get(tier, 5))
+        return out[:limit_out]
