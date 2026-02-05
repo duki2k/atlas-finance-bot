@@ -1,3 +1,8 @@
+# main.py — Atlas Radar Pro (FINAL) ✅
+# SPOT-only | Canal MEMBRO (4h) + Canal INVESTIDOR (1m/5m/15m)
+# Comandos: /status /scan_membro /scan_investidor /pause /resume
+# Bloqueio: comandos só no canal CANAL_ADMIN (config.py)
+
 import os
 import asyncio
 import contextlib
@@ -24,6 +29,9 @@ client = discord.Client(intents=intents)
 
 ADMIN_CHANNEL_ID = int(getattr(config, "CANAL_ADMIN", 0) or 0)
 
+# ─────────────────────────────
+# CommandTree com bloqueio de canal (discord.py compatível)
+# ─────────────────────────────
 async def _deny(interaction: discord.Interaction, msg: str):
     try:
         if interaction.response.is_done():
@@ -60,6 +68,10 @@ _last_5m = None
 _last_15m = None
 _last_4h = None
 
+# “pulso sem setup” no canal investidor (anti-spam)
+_last_no_setup_inv_ts = 0.0
+NO_SETUP_INV_COOLDOWN_SECONDS = 30 * 60  # 30 minutos
+
 
 async def log(msg: str):
     cid = int(getattr(config, "CANAL_LOGS", 0) or 0)
@@ -73,6 +85,47 @@ async def log(msg: str):
             return
     with contextlib.suppress(Exception):
         await ch.send(f"📡 {msg}")
+
+
+async def post_no_setup_investidor(slot: str):
+    """
+    Quando não há setups, envia um embed informativo (profissional) no canal INVESTIDOR,
+    mas no máximo 1x a cada NO_SETUP_INV_COOLDOWN_SECONDS.
+    """
+    global _last_no_setup_inv_ts
+
+    if notifier is None:
+        return
+
+    now = datetime.now(BR_TZ)
+    now_ts = now.timestamp()
+    if (now_ts - _last_no_setup_inv_ts) < NO_SETUP_INV_COOLDOWN_SECONDS:
+        return
+
+    channel_id = int(getattr(config, "CANAL_INVESTIDOR", 0) or 0)
+    if not channel_id:
+        return
+
+    emb = discord.Embed(
+        title="📭 Radar INVESTIDOR — Sem entradas agora",
+        description=(
+            f"Nenhum setup bateu nas regras neste ciclo (**{slot}**).\n"
+            "Isso é normal — **melhor ficar parado** do que forçar operação.\n\n"
+            "🧠 **Playbook rápido:**\n"
+            "• Preserve caixa\n"
+            "• Espere confirmação\n"
+            "• Não aumente mão por ansiedade\n\n"
+            "Educacional — não é recomendação financeira."
+        ),
+        color=0x95A5A6,
+    )
+    emb.set_footer(text=f"{now.strftime('%d/%m/%Y %H:%M')} BRT")
+
+    try:
+        await notifier.send_discord(channel_id, emb, role_ping_id=0)
+        _last_no_setup_inv_ts = now_ts
+    except Exception:
+        pass
 
 
 async def _post_signals(tier: str, interval: str, force: bool):
@@ -116,6 +169,8 @@ async def investidor_loop():
         return
 
     now = datetime.now(BR_TZ)
+
+    # Executa no começo do minuto (reduz drift)
     if now.second > 10:
         return
 
@@ -124,24 +179,35 @@ async def investidor_loop():
     if LOCK.locked():
         return
 
+    cand_1m = 0
+    cand_5m = 0
+    cand_15m = 0
+    sent_1m = 0
+    sent_5m = 0
+    sent_15m = 0
+
     async with LOCK:
-        # 1m
+        # 1m (todo minuto)
         if _last_1m != slot:
-            sent, cand = await _post_signals("investidor", "1m", force=False)
-            await log(f"INV 1m slot {slot}: candidatos={cand} enviados={sent}")
+            sent_1m, cand_1m = await _post_signals("investidor", "1m", force=False)
+            await log(f"INV 1m slot {slot}: candidatos={cand_1m} enviados={sent_1m}")
             _last_1m = slot
 
-        # 5m
+        # 5m (minuto múltiplo de 5)
         if now.minute % 5 == 0 and _last_5m != slot:
-            sent, cand = await _post_signals("investidor", "5m", force=False)
-            await log(f"INV 5m slot {slot}: candidatos={cand} enviados={sent}")
+            sent_5m, cand_5m = await _post_signals("investidor", "5m", force=False)
+            await log(f"INV 5m slot {slot}: candidatos={cand_5m} enviados={sent_5m}")
             _last_5m = slot
 
-        # 15m
+        # 15m (minuto múltiplo de 15)
         if now.minute % 15 == 0 and _last_15m != slot:
-            sent, cand = await _post_signals("investidor", "15m", force=False)
-            await log(f"INV 15m slot {slot}: candidatos={cand} enviados={sent}")
+            sent_15m, cand_15m = await _post_signals("investidor", "15m", force=False)
+            await log(f"INV 15m slot {slot}: candidatos={cand_15m} enviados={sent_15m}")
             _last_15m = slot
+
+            # ✅ Pulso “sem setup” — só em slot 15m (mais limpo e profissional)
+            if cand_15m == 0 and cand_5m == 0 and cand_1m == 0:
+                await post_no_setup_investidor(slot)
 
 
 @tasks.loop(seconds=20)
@@ -152,10 +218,11 @@ async def membro_loop():
         return
 
     now = datetime.now(BR_TZ)
+
     if now.second > 10:
         return
 
-    # 4h em horas múltiplas de 4, no minuto fixo
+    # 4h em horas múltiplas de 4, no minuto fixo (ex.: 00:05, 04:05, 08:05, ...)
     if now.hour % 4 != 0:
         return
     if now.minute != int(getattr(config, "MEMBRO_MINUTE", 5)):
