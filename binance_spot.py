@@ -5,7 +5,7 @@ import aiohttp
 from typing import Any, List, Tuple
 
 BASES = ["https://data-api.binance.vision", "https://api.binance.com"]
-HEADERS = {"User-Agent": "AtlasRadarPro/3.1"}
+HEADERS = {"User-Agent": "AtlasRadarV4/1.0"}
 
 def _to_f(x):
     try:
@@ -31,11 +31,10 @@ class BinanceSpot:
                 await asyncio.sleep((0.25 * (2 ** i)) + random.uniform(0, 0.2))
         return {"_error": str(last) if last else "unknown"}
 
-    async def klines(self, symbol: str, interval: str, limit: int) -> Tuple[List[int], List[float], List[float], List[float], List[float], List[float]]:
+    async def klines(self, symbol: str, interval: str, limit: int):
         j = await self._get_json("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         if not isinstance(j, list):
             return [], [], [], [], [], []
-
         t, o, h, l, c, v = [], [], [], [], [], []
         for row in j:
             ot = int(row[0])
@@ -43,5 +42,4 @@ class BinanceSpot:
             if None in (oo, hh, ll, cc, vv):
                 continue
             t.append(ot); o.append(oo); h.append(hh); l.append(ll); c.append(cc); v.append(vv)
-
         return t, o, h, l, c, v
