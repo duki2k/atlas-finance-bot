@@ -1,25 +1,23 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 from typing import Dict, Set
 
 
 @dataclass
 class State:
     seen_news: Set[str] = field(default_factory=set)
-    last_sent: Dict[str, float] = field(default_factory=dict)
-    debug_enabled: bool = False
+    last_ts: Dict[str, float] = field(default_factory=dict)
 
-    def mark_news(self, key: str):
-        self.seen_news.add(key)
+    def mark_news(self, key: str) -> None:
+        if key:
+            self.seen_news.add(key)
 
-    def news_seen(self, key: str) -> bool:
-        return key in self.seen_news
-
-    def cooldown_ok(self, key: str, cooldown_sec: int) -> bool:
+    def cooldown_ok(self, key: str, seconds: int) -> bool:
+        """Retorna True se pode enviar e já atualiza o timestamp."""
         now = time.time()
-        last = self.last_sent.get(key, 0.0)
-        if now - last < cooldown_sec:
+        last = self.last_ts.get(key, 0.0)
+        if (now - last) < float(seconds):
             return False
-        self.last_sent[key] = now
+        self.last_ts[key] = now
         return True
