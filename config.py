@@ -56,12 +56,13 @@ NEWS_MAX_ITEMS_INVEST = 7
 # Feeds RSS (EN base; PT você traduz no texto)
 # Formato: lista de URLs
 NEWS_RSS_FEEDS_EN = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
-    "https://cointelegraph.com/rss",
-    "https://cryptoslate.com/feed/",
-    "https://cryptopotato.com/feed/",
-    "https://thedefiant.io/feed/",
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("CryptoSlate", "https://cryptoslate.com/feed/"),
+    ("CryptoPotato", "https://cryptopotato.com/feed/"),
+    ("The Defiant", "https://thedefiant.io/feed/"),
 ]
+
 
 # ─────────────────────────────
 # Binance = Mentor (INVESTIMENTO) — sem entradas
