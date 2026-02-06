@@ -22,10 +22,47 @@ from .commands_admin import register_admin_commands
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
 
+def _now_brt() -> datetime:
+    return datetime.now(BR_TZ)
+
+
+def _should_run_at_times(now: datetime, times: list[str]) -> bool:
+    # times exemplo: ["09:00", "18:00"]
+    hhmm = now.strftime("%H:%M")
+    return hhmm in set(times or [])
+
+
 class AtlasClient(discord.Client):
     def __init__(self, intents: discord.Intents):
         super().__init__(intents=intents)
-        self.tree = discord.app_commands.CommandTree(self)
+        self.tree = AtlasTree(self)
+
+
+class AtlasTree(discord.app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        admin_ch = int(getattr(config, "CANAL_ADMIN_BOT", 0) or 0)
+        if admin_ch <= 0:
+            return True
+
+        # bloqueia DM
+        if interaction.guild is None:
+            with contextlib.suppress(Exception):
+                if interaction.response.is_done():
+                    await interaction.followup.send("⛔ Use comandos apenas no servidor.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("⛔ Use comandos apenas no servidor.", ephemeral=True)
+            return False
+
+        if interaction.channel_id != admin_ch:
+            with contextlib.suppress(Exception):
+                msg = f"⛔ Use comandos apenas em <#{admin_ch}>."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            return False
+
+        return True
 
 
 async def run():
@@ -48,8 +85,7 @@ async def run():
     tg = TelegramNotifier(session, settings.telegram_token, settings.telegram_chat_id)
 
     feeds_en = list(getattr(config, "NEWS_RSS_FEEDS_EN", []))
-    max_items = int(getattr(config, "NEWS_MAX_ITEMS_EACH", 6) or 6)
-    newsroom = NewsroomEngine(feeds_en=feeds_en, max_items=max_items)
+    newsroom = NewsroomEngine(feeds_en=feeds_en)
 
     news_job = NewsJob(
         state=state,
@@ -57,10 +93,16 @@ async def run():
         notifier=notifier,
         tg=tg,
         engine=newsroom,
-        channel_id=int(getattr(config, "CANAL_NEWS_CRIPTO", 0) or 0),
+        channel_member_id=int(getattr(config, "CANAL_NEWS_MEMBRO", 0) or 0),
+        channel_invest_id=int(getattr(config, "CANAL_NEWS_INVESTIDOR", 0) or 0),
+        max_member=int(getattr(config, "NEWS_MAX_ITEMS_MEMBER", 4) or 4),
+        max_invest=int(getattr(config, "NEWS_MAX_ITEMS_INVEST", 7) or 7),
         telegram_enabled=bool(getattr(config, "TELEGRAM_ENABLED", False) and getattr(config, "TELEGRAM_SEND_NEWS", True)),
         discord_invite=str(getattr(config, "DISCORD_INVITE_LINK", "") or "").strip(),
     )
+
+    member_times = list(getattr(config, "NEWS_MEMBER_TIMES", ["09:00"]))
+    invest_times = list(getattr(config, "NEWS_INVEST_TIMES", ["09:00", "18:00"]))
 
     async def sync_commands():
         try:
@@ -77,8 +119,8 @@ async def run():
 
     async def force_all():
         try:
-            await news_job.run()
-            return "OK (news)"
+            await news_job.run_both()
+            return "OK (news membro+invest)"
         except Exception as e:
             await logger.error(f"FORCE_ALL falhou: {e}")
             return f"FAIL ({e})"
@@ -108,21 +150,25 @@ async def run():
         await logger.info(f"READY: {client.user} (sync={settings.sync_commands})")
         if settings.sync_commands:
             await sync_commands()
-        await logger.info("Job NEWS armado (v6).")
+        await logger.info(f"NEWS schedule: membro={member_times} invest={invest_times}")
 
     async def news_loop():
-        every = int(getattr(config, "NEWS_EVERY_MINUTES", 30) or 30)
         last_key = None
         while not stop_event.is_set():
             try:
-                now = datetime.now(BR_TZ)
+                now = _now_brt()
                 minute_key = now.strftime("%Y-%m-%d %H:%M")
-                if minute_key != last_key and (now.minute % every == 0):
+                if minute_key != last_key:
                     last_key = minute_key
-                    await news_job.run()
+
+                    # Se bateu algum horário (membro OU investidor), manda para os dois canais,
+                    # mas o INVESTIDOR tem 2 horários no dia e o MEMBRO só 1.
+                    if _should_run_at_times(now, member_times) or _should_run_at_times(now, invest_times):
+                        await news_job.run_both()
+
             except Exception as e:
                 await logger.error(f"NEWS LOOP error: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
