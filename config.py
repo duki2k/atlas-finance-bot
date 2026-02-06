@@ -1,27 +1,39 @@
 # ─────────────────────────────
-# Canais (Atlas v6)
+# Parcerias / Links
 # ─────────────────────────────
-CANAL_ADMIN_BOT = 1467296892256911493
-
-CANAL_LOGS = 1467579765274837064
-CANAL_LOGS_SINAIS = 1469445445460693102
-
-CANAL_NEWS_MEMBRO = 1466255506657251469
-CANAL_NEWS_INVESTIDOR = 1469445663983931503
-
-CANAL_BINANCE_MEMBRO = 1468861013138079859
-CANAL_BINANCE_INVESTIDOR = 1468294566024052800
-
-CANAL_TRADING_MEMBRO = 1468877305651921090
-CANAL_TRADING_INVESTIDOR = 1468877360697839688
+BINANCE_REF_LINK = "https://www.binance.com/activity/referral-entry/CPA?ref=CPA_00V7RUKGMN"
+BINOMO_REF_LINK = "https://binomo-invitefriend.com/auth?invite_code=cdb1ad8837e4ffa1bf771e28824f5e0c#SignUp"
 
 # ─────────────────────────────
-# Newsletter (v6)
+# Binance = Mentor (INVESTIMENTO) — sem entradas
 # ─────────────────────────────
-# Membro recebe 1x por dia, Investidor 2x por dia.
-NEWS_MEMBER_TIMES = ["09:00"]
-NEWS_INVEST_TIMES = ["09:00", "18:00"]
+BINANCE_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+    "ADAUSDT","AVAXUSDT","LINKUSDT","MATICUSDT","DOGEUSDT",
+    "DOTUSDT","LTCUSDT","TRXUSDT","ATOMUSDT","TONUSDT",
+]
 
-# Quantidade de notícias por camada
-NEWS_MAX_ITEMS_MEMBER = 4
-NEWS_MAX_ITEMS_INVEST = 7
+# Membro: 1 recomendação a cada 2 dias (em um horário fixo)
+BINANCE_MEMBER_TIMES = ["09:00"]
+BINANCE_MEMBER_EVERY_DAYS = 2
+
+# Premium: 2 por dia
+BINANCE_INVEST_TIMES = ["09:00", "18:00"]
+
+# ─────────────────────────────
+# Binomo = Trading (ENTRADAS)
+# ─────────────────────────────
+# Observação: usamos Yahoo (dados públicos) para gerar entradas educacionais.
+BINOMO_TICKERS = [
+    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X",
+    "USDCHF=X","NZDUSD=X","EURJPY=X","EURGBP=X","XAUUSD=X",
+    "XAGUSD=X","CL=F","BZ=F","^GSPC","^NDX",
+]
+
+# Membro: 1 entrada por dia em M5
+TRADING_MEMBER_TIMES = ["12:00"]   # pode mudar depois se quiser
+
+# Premium: a cada 1 hora, 3 entradas (M5 + M15)
+TRADING_INVEST_ON_MINUTE = 0       # minuto do relógio (00)
+TRADING_INVEST_MAX_PER_HOUR = 3
+TRADING_INVEST_TFS = ["5m", "15m"]
