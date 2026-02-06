@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import html
-from dataclasses import dataclass
-from typing import List, Tuple
 import discord
+from dataclasses import dataclass
+from typing import List
 
 
 @dataclass
@@ -13,55 +13,8 @@ class NewsLine:
     source: str
 
 
-def _clean(s: str) -> str:
-    return html.unescape((s or "").strip())
-
-
-def _to_pt_basic(en: str) -> str:
-    """
-    Tradução simplificada (sem API) só pra ficar legível em PT.
-    Não é perfeita, mas cumpre o requisito "PT/EN" sem serviço pago.
-    """
-    t = _clean(en)
-
-    repl = {
-        " price ": " preço ",
-        " prices ": " preços ",
-        " surges ": " dispara ",
-        " rally ": " rali ",
-        " rallies ": " sobe forte ",
-        " falls ": " cai ",
-        " drops ": " cai ",
-        " plunges ": " despenca ",
-        " crash ": " desaba ",
-        " approval ": " aprovação ",
-        " sec ": " sec ",
-        " etf ": " etf ",
-        " regulation ": " regulação ",
-        " lawsuit ": " processo ",
-        " exchange ": " exchange ",
-        " stablecoin ": " stablecoin ",
-        " whales ": " baleias ",
-        " miners ": " mineradores ",
-        " network ": " rede ",
-        " inflows ": " entradas ",
-        " outflows ": " saídas ",
-        " up ": " alta ",
-        " down ": " baixa ",
-        " u.s. ": " EUA ",
-        " us ": " EUA ",
-    }
-
-    low = " " + t + " "
-    for a, b in repl.items():
-        low = low.replace(a, b)
-        low = low.replace(a.title(), b)  # tentativa simples
-
-    out = low.strip()
-    # capitalização leve
-    if out:
-        out = out[0].upper() + out[1:]
-    return out
+def _esc(s: str) -> str:
+    return html.escape((s or "").strip())
 
 
 class NewsJob:
@@ -78,6 +31,8 @@ class NewsJob:
         max_invest: int = 7,
         telegram_enabled: bool = False,
         discord_invite: str = "",
+        binance_link: str = "",
+        binomo_link: str = "",
     ):
         self.state = state
         self.logger = logger
@@ -90,20 +45,16 @@ class NewsJob:
         self.max_invest = int(max_invest or 7)
         self.telegram_enabled = bool(telegram_enabled)
         self.discord_invite = (discord_invite or "").strip()
+        self.binance_link = (binance_link or "").strip()
+        self.binomo_link = (binomo_link or "").strip()
 
     async def run_both(self):
-        """
-        Envia:
-        - Discord (membro e investidor)
-        - Telegram (sempre modo MEMBRO)
-        """
         lines, sources = await self.engine.fetch_lines()
-
         if not lines:
             await self.logger.info("NEWS: sem itens novos.")
             return
 
-        # Dedup simples por EN
+        # dedupe por EN
         fresh: List[NewsLine] = []
         for ln in lines:
             key = (ln.en or "").strip().lower()
@@ -131,56 +82,74 @@ class NewsJob:
             emb_i = self._build_embed(invest_pack, sources, tier="INVESTIDOR")
             await self.notifier.send_embed(self.channel_invest_id, emb_i)
 
-        # Telegram: SEMPRE “tipo membro” + CTA
+        # Telegram (sempre membro)
         if self.telegram_enabled:
-            txt = self._build_telegram(member_pack, sources)
-            await self.tg.send_text(txt)
+            if not getattr(self.tg, "is_configured", lambda: False)():
+                await self.logger.error("NEWS: Telegram ligado mas token/chat_id estão vazios.")
+            else:
+                txt = self._build_telegram_html(member_pack, sources)
+                ok = await self.tg.send_html(txt, disable_preview=True)
+                if not ok:
+                    err = getattr(self.tg, "last_error", "") or "falha desconhecida"
+                    await self.logger.error(f"NEWS: falha Telegram -> {err}")
+                else:
+                    await self.logger.info("NEWS: Telegram OK (modo membro).")
 
-        await self.logger.info(
-            f"NEWS: ok member={len(member_pack)} invest={len(invest_pack)} telegram={'on' if self.telegram_enabled else 'off'}"
-        )
+        await self.logger.info(f"NEWS: ok member={len(member_pack)} invest={len(invest_pack)}")
 
     def _build_embed(self, pack: List[NewsLine], sources: List[str], tier: str) -> discord.Embed:
         title = f"📰 Atlas Newsletter — Cripto (PT/EN) • {tier}"
         desc = "Texto direto (sem link). Fontes no final apenas para referência.\n🧠 Educacional — não é recomendação financeira."
         e = discord.Embed(title=title, description=desc, color=0x3498DB)
 
-        # leitura espaçada
         lines = []
         for i, ln in enumerate(pack, 1):
-            lines.append(f"**{i}) 🇧🇷** {_clean(ln.pt)}\n**{i}) 🇺🇸** {_clean(ln.en)}")
+            lines.append(f"**{i}) 🇧🇷** {ln.pt}\n**{i}) 🇺🇸** {ln.en}")
         e.add_field(name="🗞️ Notícias", value="\n\n".join(lines)[:1024], inline=False)
 
         if sources:
             e.add_field(name="📎 Fontes (referência)", value=", ".join(sorted(set(sources)))[:1024], inline=False)
 
+        # CTAs “encurtadas” (markdown)
+        ctas = []
         if self.discord_invite:
-            e.add_field(
-                name="🚀 Tempo real no Discord",
-                value=f"Entre na Atlas Community para alertas ao vivo: {self.discord_invite}",
-                inline=False,
-            )
+            ctas.append(f"🚀 [Entre no Discord ao vivo]({self.discord_invite})")
+        if self.binance_link:
+            ctas.append(f"💠 [Acesse a Binance aqui]({self.binance_link})")
+        if self.binomo_link:
+            ctas.append(f"🎯 [Acesse a Binomo aqui]({self.binomo_link})")
+        if ctas:
+            e.add_field(name="✨ Acesso rápido", value="\n".join(ctas)[:1024], inline=False)
+
         return e
 
-    def _build_telegram(self, pack: List[NewsLine], sources: List[str]) -> str:
+    def _build_telegram_html(self, pack: List[NewsLine], sources: List[str]) -> str:
         parts = []
-        parts.append("📰 Atlas Newsletter — Cripto (PT/EN)")
+        parts.append("📰 <b>Atlas Newsletter — Cripto (PT/EN)</b>")
         parts.append("Texto direto (sem link). Fontes no final apenas para referência.")
-        parts.append("🧠 Educacional — não é recomendação financeira.\n")
+        parts.append("🧠 Educacional — não é recomendação financeira.")
+        parts.append("")
 
         for i, ln in enumerate(pack, 1):
-            parts.append(f"{i}) 🇧🇷 {_clean(ln.pt)}")
-            parts.append(f"{i}) 🇺🇸 {_clean(ln.en)}")
-            parts.append("")  # espaço
+            parts.append(f"<b>{i}) 🇧🇷</b> {_esc(ln.pt)}")
+            parts.append(f"<b>{i}) 🇺🇸</b> {_esc(ln.en)}")
+            parts.append("")
 
         if sources:
-            parts.append("📎 Fontes (referência)")
-            parts.append(", ".join(sorted(set(sources))))
+            parts.append("📎 <b>Fontes (referência)</b>")
+            parts.append(_esc(", ".join(sorted(set(sources)))))
 
-        # CTA (sem prometer dinheiro garantido)
+        # CTAs (links encurtados como texto clicável)
+        parts.append("")
         if self.discord_invite:
-            parts.append("\n🚀 Quer acompanhar alertas e oportunidades em tempo real?")
-            parts.append(f"Entre na Atlas Community (Discord): {self.discord_invite}")
-            parts.append("Conteúdo educacional para ajudar você a decidir melhor o que fazer com o seu dinheiro.")
+            parts.append("🚀 <b>Tempo real no Discord</b>")
+            parts.append(f'Entre na Atlas Community: <a href="{_esc(self.discord_invite)}">Clique para entrar</a>')
+            parts.append("Conteúdo educacional para ajudar você a decidir melhor o que fazer com seu dinheiro.")
+
+        if self.binance_link:
+            parts.append(f'💠 Binance: <a href="{_esc(self.binance_link)}">Acesse aqui</a>')
+
+        if self.binomo_link:
+            parts.append(f'🎯 Binomo: <a href="{_esc(self.binomo_link)}">Acesse aqui</a>')
 
         return "\n".join(parts)
