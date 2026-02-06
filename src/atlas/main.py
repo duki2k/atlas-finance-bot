@@ -15,8 +15,14 @@ from .state import State
 from .observability import DiscordLogger
 from .notifier_discord import DiscordNotifier
 from .notifier_telegram import TelegramNotifier
+
 from .engines_newsroom import NewsroomEngine
 from .jobs_news import NewsJob
+
+from .binance_public import BinancePublic
+from .yahoo_data import YahooData
+from .engines_binance_mentor import BinanceMentorEngine
+from .engines_binomo_trading import BinomoTradingEngine
 from .commands_admin import register_admin_commands
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
@@ -26,10 +32,12 @@ def _now_brt() -> datetime:
     return datetime.now(BR_TZ)
 
 
-def _should_run_at_times(now: datetime, times: list[str]) -> bool:
-    # times exemplo: ["09:00", "18:00"]
-    hhmm = now.strftime("%H:%M")
-    return hhmm in set(times or [])
+def _hhmm(now: datetime) -> str:
+    return now.strftime("%H:%M")
+
+
+def _in_times(now: datetime, times: list[str]) -> bool:
+    return _hhmm(now) in set(times or [])
 
 
 class AtlasClient(discord.Client):
@@ -44,7 +52,6 @@ class AtlasTree(discord.app_commands.CommandTree):
         if admin_ch <= 0:
             return True
 
-        # bloqueia DM
         if interaction.guild is None:
             with contextlib.suppress(Exception):
                 if interaction.response.is_done():
@@ -72,9 +79,9 @@ async def run():
 
     state = State()
 
-    http_timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=25)
     connector = aiohttp.TCPConnector(limit=60)
-    session = aiohttp.ClientSession(timeout=http_timeout, connector=connector)
+    session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     logger = DiscordLogger(
         client=client,
@@ -84,6 +91,9 @@ async def run():
     notifier = DiscordNotifier(client)
     tg = TelegramNotifier(session, settings.telegram_token, settings.telegram_chat_id)
 
+    LOCK = asyncio.Lock()
+
+    # ── NEWS ─────────────────────────────────────────────────────────────
     feeds_en = list(getattr(config, "NEWS_RSS_FEEDS_EN", []))
     newsroom = NewsroomEngine(feeds_en=feeds_en)
 
@@ -101,9 +111,35 @@ async def run():
         discord_invite=str(getattr(config, "DISCORD_INVITE_LINK", "") or "").strip(),
     )
 
-    member_times = list(getattr(config, "NEWS_MEMBER_TIMES", ["09:00"]))
-    invest_times = list(getattr(config, "NEWS_INVEST_TIMES", ["09:00", "18:00"]))
+    news_member_times = list(getattr(config, "NEWS_MEMBER_TIMES", ["09:00"]))
+    news_invest_times = list(getattr(config, "NEWS_INVEST_TIMES", ["09:00", "18:00"]))
 
+    # ── BINANCE MENTOR (INVESTIMENTO) ────────────────────────────────────
+    binance = BinancePublic(session)
+    mentor = BinanceMentorEngine()
+
+    binance_symbols = list(getattr(config, "BINANCE_SYMBOLS", []))
+    binance_member_times = list(getattr(config, "BINANCE_MEMBER_TIMES", ["09:00"]))
+    binance_member_days = int(getattr(config, "BINANCE_MEMBER_EVERY_DAYS", 2) or 2)
+    binance_invest_times = list(getattr(config, "BINANCE_INVEST_TIMES", ["09:00", "18:00"]))
+
+    ch_binance_member = int(getattr(config, "CANAL_BINANCE_MEMBRO", 0) or 0)
+    ch_binance_invest = int(getattr(config, "CANAL_BINANCE_INVESTIDOR", 0) or 0)
+
+    # ── BINOMO TRADING ───────────────────────────────────────────────────
+    yahoo = YahooData(session)
+    trader = BinomoTradingEngine()
+
+    binomo_tickers = list(getattr(config, "BINOMO_TICKERS", []))
+    trading_member_times = list(getattr(config, "TRADING_MEMBER_TIMES", ["12:00"]))
+    invest_on_minute = int(getattr(config, "TRADING_INVEST_ON_MINUTE", 0) or 0)
+    invest_max = int(getattr(config, "TRADING_INVEST_MAX_PER_HOUR", 3) or 3)
+    invest_tfs = list(getattr(config, "TRADING_INVEST_TFS", ["5m", "15m"]))
+
+    ch_trade_member = int(getattr(config, "CANAL_TRADING_MEMBRO", 0) or 0)
+    ch_trade_invest = int(getattr(config, "CANAL_TRADING_INVESTIDOR", 0) or 0)
+
+    # ── SYNC + COMMANDS ─────────────────────────────────────────────────
     async def sync_commands():
         try:
             if settings.guild_id:
@@ -118,9 +154,34 @@ async def run():
             await logger.error(f"Falha SYNC: {e}")
 
     async def force_all():
+        # testa tudo em TODOS os canais (mesmo fora do horário)
         try:
-            await news_job.run_both()
-            return "OK (news membro+invest)"
+            async with LOCK:
+                await news_job.run_both()
+
+                # Binance mentor: manda 1 pick em ambos
+                pick = await mentor.scan(binance, binance_symbols)
+                emb_m = mentor.build_embed(pick, tier="membro")
+                emb_i = mentor.build_embed(pick, tier="investidor")
+                if ch_binance_member:
+                    await notifier.send_embed(ch_binance_member, emb_m)
+                if ch_binance_invest:
+                    await notifier.send_embed(ch_binance_invest, emb_i)
+
+                # Trading: membro 1 sinal M5; invest até 3 (M5+M15)
+                e_m = await trader.scan(yahoo, binomo_tickers, "5m", 1)
+                if ch_trade_member:
+                    await notifier.send_embed(ch_trade_member, trader.build_embed(e_m, tier="membro"))
+
+                pool = []
+                for tf in invest_tfs:
+                    pool += await trader.scan(yahoo, binomo_tickers, tf, invest_max)
+                pool.sort(key=lambda x: x.score, reverse=True)
+                pool = pool[:invest_max]
+                if ch_trade_invest:
+                    await notifier.send_embed(ch_trade_invest, trader.build_embed(pool, tier="investidor"))
+
+            return "OK (news + binance mentor + binomo trading)"
         except Exception as e:
             await logger.error(f"FORCE_ALL falhou: {e}")
             return f"FAIL ({e})"
@@ -150,31 +211,110 @@ async def run():
         await logger.info(f"READY: {client.user} (sync={settings.sync_commands})")
         if settings.sync_commands:
             await sync_commands()
-        await logger.info(f"NEWS schedule: membro={member_times} invest={invest_times}")
+        await logger.info("Loops: NEWS + BINANCE_MENTOR + BINOMO_TRADING armados.")
 
-    async def news_loop():
+    # ───────────────────────── LOOPS ─────────────────────────
+    async def loop_news():
+        last = None
+        while not stop_event.is_set():
+            try:
+                now = _now_brt()
+                key = now.strftime("%Y-%m-%d %H:%M")
+                if key != last:
+                    last = key
+                    if _in_times(now, news_member_times) or _in_times(now, news_invest_times):
+                        async with LOCK:
+                            await news_job.run_both()
+            except Exception as e:
+                await logger.error(f"NEWS LOOP error: {e}")
+            await asyncio.sleep(30)
+
+    async def loop_binance_mentor():
         last_key = None
         while not stop_event.is_set():
             try:
                 now = _now_brt()
-                minute_key = now.strftime("%Y-%m-%d %H:%M")
-                if minute_key != last_key:
-                    last_key = minute_key
+                key = now.strftime("%Y-%m-%d %H:%M")
+                if key != last_key:
+                    last_key = key
 
-                    # Se bateu algum horário (membro OU investidor), manda para os dois canais,
-                    # mas o INVESTIDOR tem 2 horários no dia e o MEMBRO só 1.
-                    if _should_run_at_times(now, member_times) or _should_run_at_times(now, invest_times):
-                        await news_job.run_both()
+                    # Premium 2x/dia
+                    if _in_times(now, binance_invest_times):
+                        async with LOCK:
+                            pick = await mentor.scan(binance, binance_symbols)
+                            emb = mentor.build_embed(pick, tier="investidor")
+                            if ch_binance_invest:
+                                await notifier.send_embed(ch_binance_invest, emb)
+                            await logger.info(f"BINANCE INVEST sent {key} pick={'OK' if pick else 'NONE'}")
 
+                    # Membro a cada 2 dias, em horário fixo
+                    if _in_times(now, binance_member_times):
+                        # cooldown 2 dias (em memória; se reiniciar o bot, ele pode reenviar)
+                        if state.cooldown_ok("binance_member_2days", binance_member_days * 24 * 3600):
+                            async with LOCK:
+                                pick = await mentor.scan(binance, binance_symbols)
+                                emb = mentor.build_embed(pick, tier="membro")
+                                if ch_binance_member:
+                                    await notifier.send_embed(ch_binance_member, emb)
+                                await logger.info(f"BINANCE MEMBRO sent {key} pick={'OK' if pick else 'NONE'}")
             except Exception as e:
-                await logger.error(f"NEWS LOOP error: {e}")
+                await logger.error(f"BINANCE LOOP error: {e}")
             await asyncio.sleep(30)
+
+    async def loop_binomo_trading():
+        last_member_day = None
+        last_invest_hour = None
+        while not stop_event.is_set():
+            try:
+                now = _now_brt()
+
+                # mercado fechado (simplificado): fim de semana
+                is_weekend = datetime.utcnow().weekday() >= 5
+
+                # MEMBRO: 1x/dia (M5)
+                day_key = now.strftime("%Y-%m-%d")
+                if day_key != last_member_day and _in_times(now, trading_member_times):
+                    last_member_day = day_key
+                    if is_weekend:
+                        await logger.info(f"TRADING MEMBRO skip (mercado fechado) {day_key}")
+                    else:
+                        async with LOCK:
+                            entries = await trader.scan(yahoo, binomo_tickers, "5m", 1)
+                            if entries and ch_trade_member:
+                                await notifier.send_embed(ch_trade_member, trader.build_embed(entries, "membro"))
+                                await logger.info(f"TRADING MEMBRO sent {now.strftime('%Y-%m-%d %H:%M')}")
+                            else:
+                                await logger.info(f"TRADING MEMBRO sem entradas {now.strftime('%Y-%m-%d %H:%M')}")
+
+                # INVESTIDOR: 1x/h no minuto 00 → 3 entradas (M5+M15)
+                hour_key = now.strftime("%Y-%m-%d %H")
+                if now.minute == invest_on_minute and hour_key != last_invest_hour:
+                    last_invest_hour = hour_key
+                    if is_weekend:
+                        await logger.info(f"TRADING INVEST skip (mercado fechado) {hour_key}")
+                    else:
+                        async with LOCK:
+                            pool = []
+                            for tf in invest_tfs:
+                                pool += await trader.scan(yahoo, binomo_tickers, tf, invest_max)
+                            pool.sort(key=lambda x: x.score, reverse=True)
+                            pool = pool[:invest_max]
+                            if pool and ch_trade_invest:
+                                await notifier.send_embed(ch_trade_invest, trader.build_embed(pool, "investidor"))
+                                await logger.info(f"TRADING INVEST sent {hour_key}: n={len(pool)}")
+                            else:
+                                await logger.info(f"TRADING INVEST sem entradas {hour_key}")
+            except Exception as e:
+                await logger.error(f"TRADING LOOP error: {e}")
+            await asyncio.sleep(20)
 
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
     async with client:
-        asyncio.create_task(news_loop())
+        asyncio.create_task(loop_news())
+        asyncio.create_task(loop_binance_mentor())
+        asyncio.create_task(loop_binomo_trading())
         await client.start(settings.discord_token)
 
 
