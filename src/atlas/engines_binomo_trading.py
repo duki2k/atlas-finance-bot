@@ -1,81 +1,112 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
-import discord
+
 import pytz
+import discord
 import config
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
+
 @dataclass
-class Entry:
-    tf: str
+class TradeEntry:
     ticker: str
-    side: str   # "COMPRA" | "VENDA"
+    tf: str
+    side: str         # "COMPRA" | "VENDA"
     price: float
     entry: float
     stop: float
     tp1: float
     tp2: float
     risk_pct: float
-    why: str
+    tp1_pct: float
+    tp2_pct: float
     score: float
+    why: str
     next_time_str: str
-    next_minute: int
 
-def ema(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period: return None
+
+def _fmt_price(p: float) -> str:
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:,.4f}"
+    return f"{p:,.6f}"
+
+
+def _masked(label: str, url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    return f"[{label}]({url})"
+
+
+def _ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
     k = 2 / (period + 1)
     e = values[0]
     for v in values[1:]:
         e = v * k + e * (1 - k)
     return e
 
-def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+
+def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
     n = min(len(highs), len(lows), len(closes))
-    if n < period + 2: return None
+    if n < period + 2:
+        return None
     trs = []
     for i in range(1, n):
-        h = highs[i]; l = lows[i]; pc = closes[i - 1]
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         trs.append(tr)
-    if len(trs) < period: return None
+    if len(trs) < period:
+        return None
     return sum(trs[-period:]) / period
 
-def _fmt(p: float) -> str:
-    if p >= 1000: return f"{p:,.2f}"
-    if p >= 1: return f"{p:,.4f}"
-    return f"{p:,.6f}"
 
-def _next_slot(now: datetime, tf: str) -> Tuple[datetime, int]:
+def _next_slot(now: datetime, tf: str) -> datetime:
     now = now.replace(second=0, microsecond=0)
+    if tf == "1m":
+        return now + timedelta(minutes=1)
     if tf == "5m":
-        m = now.minute
-        nm = ((m // 5) + 1) * 5
+        nm = ((now.minute // 5) + 1) * 5
         if nm >= 60:
-            nxt = now.replace(minute=0) + timedelta(hours=1)
-            return nxt, 0
-        return now.replace(minute=nm), nm
+            return now.replace(minute=0) + timedelta(hours=1)
+        return now.replace(minute=nm)
     if tf == "15m":
-        m = now.minute
-        nm = ((m // 15) + 1) * 15
+        nm = ((now.minute // 15) + 1) * 15
         if nm >= 60:
-            nxt = now.replace(minute=0) + timedelta(hours=1)
-            return nxt, 0
-        return now.replace(minute=nm), nm
+            return now.replace(minute=0) + timedelta(hours=1)
+        return now.replace(minute=nm)
     # fallback
-    nxt = now + timedelta(minutes=1)
-    return nxt, nxt.minute
+    return now + timedelta(minutes=1)
+
 
 class BinomoTradingEngine:
-    def __init__(self):
-        self.fast = 9
-        self.slow = 21
+    """
+    Binomo = TRADING (qualidade > quantidade).
+    Usa YahooData.chart() (dados públicos) para gerar entradas educacionais.
+    """
 
-    def _plan(self, side: str, price: float, a: float) -> Tuple[float, float, float, float, float]:
+    def __init__(self):
+        self.thr = {
+            "1m": float(getattr(config, "TRADING_SPIKE_1M", 0.25)),
+            "5m": float(getattr(config, "TRADING_SPIKE_5M", 0.60)),
+            "15m": float(getattr(config, "TRADING_SPIKE_15M", 1.00)),
+        }
+        self.min_score = float(getattr(config, "TRADING_MIN_SCORE", 70.0))
+        self.ema_fast = int(getattr(config, "TRADING_EMA_FAST", 9))
+        self.ema_slow = int(getattr(config, "TRADING_EMA_SLOW", 21))
+
+    def _plan(self, side: str, price: float, atr: float) -> Tuple[float, float, float, float, float, float, float]:
         entry = price
-        risk = (1.2 * a) if a and a > 0 else price * 0.004  # fallback ~0.4%
+        risk = (1.2 * atr) if atr and atr > 0 else price * 0.0035  # fallback ~0.35%
 
         if side == "COMPRA":
             stop = entry - risk
@@ -86,114 +117,143 @@ class BinomoTradingEngine:
             tp1 = entry - risk
             tp2 = entry - 2 * risk
 
-        risk_pct = abs((entry - stop) / entry) * 100.0 if entry else 0.0
-        return entry, stop, tp1, tp2, risk_pct
+        risk_pct = abs((entry - stop) / entry) * 100.0
+        tp1_pct = abs((tp1 - entry) / entry) * 100.0
+        tp2_pct = abs((tp2 - entry) / entry) * 100.0
+        return entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct
 
-    def _score(self, abs_chg: float, crossed: bool) -> float:
-        s = abs_chg * 120.0
-        if crossed:
-            s += 35.0
+    def _score(self, abs_chg: float, ema_cross: bool, break_like: bool) -> float:
+        s = min(abs_chg, 2.5) * 30.0  # 0..75
+        if ema_cross:
+            s += 18.0
+        if break_like:
+            s += 12.0
         return s
 
-    async def scan(self, yahoo, tickers: List[str], tf: str, max_out: int) -> List[Entry]:
+    async def scan_best(self, yahoo, tickers: List[str], tf: str) -> Optional[TradeEntry]:
         now = datetime.now(BR_TZ)
-        nxt_dt, nxt_min = _next_slot(now, tf)
+        nxt = _next_slot(now, tf)
 
-        out: List[Entry] = []
-
-        for t in tickers:
+        best: Optional[TradeEntry] = None
+        for tkr in tickers:
             try:
-                o, h, l, c = await yahoo.candles(t, tf)
-                if len(c) < 40:
+                # YahooData.chart(ticker, interval, range_="1d")
+                ts, o, h, l, c = await yahoo.chart(tkr, tf, "1d")
+                if len(c) < 60:
                     continue
 
                 price = float(c[-1])
-                prev = float(c[-2])
-                chg = ((price - prev) / prev) * 100.0 if prev else 0.0
-                abs_chg = abs(chg)
-
-                a = atr([float(x) for x in h], [float(x) for x in l], [float(x) for x in c], 14) or 0.0
-
-                # regras simples e úteis: spike + EMA cross
-                crossed = False
-                fast = ema([float(x) for x in c][-60:], self.fast)
-                slow = ema([float(x) for x in c][-60:], self.slow)
-                fast_prev = ema([float(x) for x in c][-61:-1], self.fast)
-                slow_prev = ema([float(x) for x in c][-61:-1], self.slow)
-
-                if None not in (fast, slow, fast_prev, slow_prev):
-                    if fast_prev <= slow_prev and fast > slow:
-                        crossed = True
-                        side = "COMPRA"
-                        why = "EMA9 cruzou acima da EMA21."
-                    elif fast_prev >= slow_prev and fast < slow:
-                        crossed = True
-                        side = "VENDA"
-                        why = "EMA9 cruzou abaixo da EMA21."
-                    else:
-                        side = "COMPRA" if chg > 0 else "VENDA"
-                        why = f"Movimento do candle ({tf}): {chg:+.2f}%."
-                else:
-                    side = "COMPRA" if chg > 0 else "VENDA"
-                    why = f"Movimento do candle ({tf}): {chg:+.2f}%."
-
-                # filtro: evitar mandar ruído
-                if abs_chg < (0.08 if tf == "5m" else 0.12) and not crossed:
+                prev = float(c[-2]) if c[-2] else 0.0
+                if prev <= 0:
                     continue
 
-                entry, stop, tp1, tp2, risk_pct = self._plan(side, price, a)
-                score = self._score(abs_chg, crossed)
+                chg = ((price - prev) / prev) * 100.0
+                abs_chg = abs(chg)
 
-                out.append(Entry(
-                    tf=tf, ticker=t, side=side, price=price,
-                    entry=entry, stop=stop, tp1=tp1, tp2=tp2,
-                    risk_pct=risk_pct, why=why, score=score,
-                    next_time_str=nxt_dt.strftime("%H:%M"),
-                    next_minute=nxt_min,
-                ))
+                # qualidade: precisa bater o threshold do timeframe
+                if abs_chg < self.thr.get(tf, 999.0):
+                    continue
+
+                side = "COMPRA" if chg > 0 else "VENDA"
+
+                atr = _atr(h, l, c, 14) or 0.0
+                entry, stop, tp1, tp2, risk_pct, tp1_pct, tp2_pct = self._plan(side, price, atr)
+
+                fast = _ema(c[-80:], self.ema_fast)
+                slow = _ema(c[-80:], self.ema_slow)
+                fast_prev = _ema(c[-81:-1], self.ema_fast)
+                slow_prev = _ema(c[-81:-1], self.ema_slow)
+
+                ema_cross = False
+                if None not in (fast, slow, fast_prev, slow_prev):
+                    if fast_prev <= slow_prev and fast > slow:
+                        ema_cross = True
+                        side = "COMPRA"
+                    elif fast_prev >= slow_prev and fast < slow:
+                        ema_cross = True
+                        side = "VENDA"
+
+                # “break-like” simples: candle atual rompendo faixa recente
+                lookback = 20
+                hi = max(h[-(lookback+1):-1])
+                lo = min(l[-(lookback+1):-1])
+                break_like = (price > hi) or (price < lo)
+
+                score = self._score(abs_chg, ema_cross, break_like)
+                if score < self.min_score:
+                    continue
+
+                why = f"Candle {tf}: {chg:+.2f}%"
+                if ema_cross:
+                    why += f" | EMA{self.ema_fast} x EMA{self.ema_slow}"
+                if break_like:
+                    why += " | rompimento recente"
+
+                cand = TradeEntry(
+                    ticker=tkr,
+                    tf=tf,
+                    side=side,
+                    price=price,
+                    entry=entry,
+                    stop=stop,
+                    tp1=tp1,
+                    tp2=tp2,
+                    risk_pct=risk_pct,
+                    tp1_pct=tp1_pct,
+                    tp2_pct=tp2_pct,
+                    score=score,
+                    why=why,
+                    next_time_str=nxt.strftime("%H:%M"),
+                )
+
+                if best is None or cand.score > best.score:
+                    best = cand
             except Exception:
                 continue
 
-        out.sort(key=lambda x: x.score, reverse=True)
-        return out[:max_out]
+        return best
 
-    def build_embed(self, entries: List[Entry], tier: str) -> discord.Embed:
-        now = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M")
-        ref = str(getattr(config, "BINOMO_REF_LINK", "") or "").strip()
-
-        if not entries:
-            e = discord.Embed(
-                title=f"📉 Binomo Trading — {tier.upper()} (sem entradas)",
-                description="Sem entradas válidas neste ciclo (ou mercado fechado).\n🧠 Educacional — não é recomendação financeira.",
-                color=0x95A5A6,
-            )
-            if ref:
-                e.add_field(name="🔗 Binomo (indicação)", value=ref, inline=False)
-            e.set_footer(text=f"Atlas v6 • {now} BRT")
-            return e
-
+    def build_embed(self, entries: List[TradeEntry], tier: str) -> discord.Embed:
+        now = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
+        title = f"📈 Binomo Trading — {tier.upper()}"
         e = discord.Embed(
-            title=f"📉 Binomo Trading — {tier.upper()}",
-            description="Entradas educacionais (curto prazo).\n🧠 Educacional — não é recomendação financeira.",
+            title=title,
+            description="Entradas educacionais (qualidade > quantidade).\n🧠 Educacional — não é recomendação financeira.",
             color=0x9B59B6,
         )
 
-        for idx, s in enumerate(entries, start=1):
-            arrow = "⬆️" if s.side == "COMPRA" else "⬇️"
+        if not entries:
             e.add_field(
-                name=f"{idx}) {arrow} {s.side} • {s.tf} • {s.ticker}",
-                value=(
-                    f"Preço: **{_fmt(s.price)}** | Entrada: **{_fmt(s.entry)}**\n"
-                    f"Stop: **{_fmt(s.stop)}** (risco **{s.risk_pct:.2f}%**)\n"
-                    f"TP1: **{_fmt(s.tp1)}** • TP2: **{_fmt(s.tp2)}**\n"
-                    f"Minuto: **{s.next_time_str} BRT** (min **{s.next_minute:02d}**)\n"
-                    f"Motivo: {s.why}"
-                ),
+                name="📌 Sem entradas válidas",
+                value="Nenhum setup forte o suficiente neste ciclo (ou mercado fechado).",
                 inline=False,
             )
+        else:
+            lines = []
+            for i, s in enumerate(entries, 1):
+                arrow = "⬆️" if s.side == "COMPRA" else "⬇️"
+                lines.append(
+                    f"**{i}) {arrow} {s.side}** • `{s.ticker}` • **{s.tf}**\n"
+                    f"Motivo: {s.why}\n"
+                    f"Preço: **{_fmt_price(s.price)}** | Entrada: **{_fmt_price(s.entry)}**\n"
+                    f"Stop: **{_fmt_price(s.stop)}** (risco **{s.risk_pct:.2f}%**)\n"
+                    f"TP1: **{_fmt_price(s.tp1)}** (**{s.tp1_pct:.2f}%**) | TP2: **{_fmt_price(s.tp2)}** (**{s.tp2_pct:.2f}%**)\n"
+                    f"⏱️ Próximo candle: **{s.next_time_str} BRT**"
+                )
+            e.add_field(name="🎯 Entradas", value="\n\n".join(lines)[:1024], inline=False)
 
-        if ref:
-            e.add_field(name="🔗 Binomo (indicação)", value=ref, inline=False)
+        # CTA (sem “indicação”)
+        discord_invite = (getattr(config, "DISCORD_INVITE_LINK", "") or "").strip()
+        binomo_ref = (getattr(config, "BINOMO_REF_LINK", "") or "").strip()
 
-        e.set_footer(text=f"Atlas v6 • {now} BRT")
+        ctas = []
+        if binomo_ref:
+            ctas.append(f"🎯 {_masked('Acesse aqui e liberar acesso', binomo_ref)}")
+        if discord_invite:
+            ctas.append(f"🚀 {_masked('Entre no Discord e acompanhe ao vivo', discord_invite)}")
+
+        if ctas:
+            e.add_field(name="✨ Acesso rápido", value="\n".join(ctas)[:1024], inline=False)
+
+        e.set_footer(text=f"Atlas v6 • {now}")
         return e
