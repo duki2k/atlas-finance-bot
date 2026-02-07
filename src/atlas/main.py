@@ -11,12 +11,13 @@ from discord import app_commands
 import pytz
 
 import config
-from notifier import Notifier
-from binance_spot import BinanceSpot
-from yahoo_data import YahooData
-from engines_binance import BinanceMentorEngine
-from engines_binomo import BinomoEngine
-from news_engine import NewsEngine
+
+from atlas.notifier import Notifier
+from atlas.binance_spot import BinanceSpot
+from atlas.yahoo_data import YahooData
+from atlas.engines_binance import BinanceMentorEngine
+from atlas.engines_binomo import BinomoEngine
+from atlas.news_engine import NewsEngine
 
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
