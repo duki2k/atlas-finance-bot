@@ -13,7 +13,7 @@ import pytz
 import config
 
 from .notifier import Notifier
-from atlas.binance_spot import BinanceSpot
+from .binance_spot import BinanceSpot
 from atlas.yahoo_data import YahooData
 from atlas.engines_binance import BinanceMentorEngine
 from atlas.engines_binomo import BinomoEngine
