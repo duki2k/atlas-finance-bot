@@ -15,7 +15,7 @@ import config
 from .notifier import Notifier
 from .binance_spot import BinanceSpot
 from atlas.yahoo_data import YahooData
-from atlas.engines_binance import BinanceMentorEngine
+from .engines_binance import BinanceMentorEngine
 from atlas.engines_binomo import BinomoEngine
 from atlas.news_engine import NewsEngine
 
