@@ -1,171 +1,176 @@
 from __future__ import annotations
 
-import asyncio
 import html
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Union, Optional
+from typing import List, Sequence, Tuple, Optional
 
 import feedparser
+
 import config
 
 
 @dataclass
 class NewsLine:
-    pt: str
     en: str
+    pt: str
     source: str
 
 
 def _clean(s: str) -> str:
-    return html.unescape((s or "").strip())
+    s = (s or "").strip()
+    s = html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def _pt_headline(en: str) -> str:
+def _strip_site_suffix(title: str) -> str:
+    # Remove " - CoinDesk" / " | Cointelegraph" etc
+    t = title
+    t = re.sub(r"\s+[-|]\s+(CoinDesk|Cointelegraph|CryptoPotato|The Defiant|Decrypt|Bloomberg|Reuters|CNBC|Fortune|WSJ|FT|NYT)\s*$", "", t, flags=re.I)
+    return t.strip()
+
+
+_BASIC_MAP = {
+    "surges": "dispara",
+    "jumps": "salta",
+    "falls": "cai",
+    "tumbles": "despenca",
+    "rallies": "sobe forte",
+    "plunges": "despenca",
+    "crashes": "desaba",
+    "approves": "aprova",
+    "rejects": "rejeita",
+    "raises": "capta",
+    "sec": "SEC",
+    "etf": "ETF",
+    "spot": "spot",
+    "crypto": "cripto",
+    "bitcoin": "Bitcoin",
+    "ether": "Ether",
+    "ethereum": "Ethereum",
+    "xrp": "XRP",
+    "stablecoin": "stablecoin",
+    "market": "mercado",
+    "bill": "projeto de lei",
+    "lawsuit": "processo",
+    "probe": "investigação",
+    "exchange": "exchange",
+    "regulator": "regulador",
+    "approval": "aprovação",
+    "ban": "banimento",
+    "launches": "lança",
+    "to exit": "vai sair",
+    "reduce staff": "reduzir equipe",
+    "focus on": "focar em",
+    "under fire": "sob críticas",
+}
+
+
+def translate_to_pt(text: str) -> str:
     """
-    Tradutor offline (sem API) focado em TÍTULOS.
-    Não é perfeito, mas melhora bastante a legibilidade sem depender de serviço externo.
+    Tradução *offline* (heurística). Não é perfeita, mas evita depender de API.
+    Mantém nomes próprios e termos do mercado.
     """
-    t = _clean(en)
+    t = _clean(text)
+    t = _strip_site_suffix(t)
 
-    patterns = [
-        (r"^(?P<who>.+?) shares jump (?P<pct>\d+)% after (?P<why>.+)$",
-         lambda d: f"Ações da {d['who']} sobem {d['pct']}% após {d['why']}"),
-        (r"^(?P<who>.+?) jumps (?P<pct>\d+)% after (?P<why>.+)$",
-         lambda d: f"{d['who']} sobe {d['pct']}% após {d['why']}"),
-        (r"^(?P<who>.+?) rockets (?P<pct>\d+)%.*$",
-         lambda d: f"{d['who']} dispara {d['pct']}%"),
-        (r"^(?P<who>.+?) tumbles below (?P<lvl>[\$€£]?\d[\d,\.]+).*$",
-         lambda d: f"{d['who']} cai e fica abaixo de {d['lvl']}"),
-        (r"^(?P<who>.+?) falls to (?P<lvl>[\$€£]?\d[\d,\.]+).*$",
-         lambda d: f"{d['who']} cai para {d['lvl']}"),
-        (r"^Three signs that (?P<who>.+?) price could be near (?P<why>.+)$",
-         lambda d: f"Três sinais de que o preço de {d['who']} pode estar perto de {d['why']}"),
-        (r"^(?P<who>.+?) is under fire after (?P<why>.+)$",
-         lambda d: f"{d['who']} fica sob pressão após {d['why']}"),
-        (r"^(?P<who>.+?) prepares to (?P<do>.+)$",
-         lambda d: f"{d['who']} se prepara para {d['do']}"),
-        (r"^(?P<who>.+?) to exit (?P<where>.+?), reduce staff by (?P<pct>\d+)%.*$",
-         lambda d: f"{d['who']} vai sair de {d['where']} e reduzir equipe em {d['pct']}%"),
-    ]
-
-    for rx, fn in patterns:
-        m = re.match(rx, t, flags=re.IGNORECASE)
-        if m:
-            out = fn(m.groupdict())
-            return (out[0].upper() + out[1:]) if out else t
-
-    dict_map = {
-        "shares": "ações",
-        "jump": "sobem",
-        "jumps": "sobe",
-        "rocket": "dispara",
-        "rockets": "dispara",
-        "falls": "cai",
-        "drops": "cai",
-        "plunges": "despenca",
-        "market": "mercado",
-        "under fire": "sob pressão",
-        "retirement funds": "fundos de aposentadoria",
-        "brutal": "forte",
-        "trend": "tendência",
-        "regulation": "regulação",
-        "lawsuit": "processo",
-        "exchange": "exchange",
-        "stablecoin": "stablecoin",
-        "whales": "baleias",
-        "miners": "mineradores",
-        "network": "rede",
-        "inflows": "entradas",
-        "outflows": "saídas",
-        "U.S.": "EUA",
-        "U.K.": "Reino Unido",
-        "EU": "União Europeia",
-        "crypto": "cripto",
-    }
-
+    # substituições por palavras/frases comuns (case-insensitive)
     out = t
-    for a, b in dict_map.items():
-        out = re.sub(rf"\b{re.escape(a)}\b", b, out, flags=re.IGNORECASE)
 
-    return (out[0].upper() + out[1:]) if out else out
+    # frases primeiro (mais seguras)
+    phrases = [
+        ("is under fire", "está sob críticas"),
+        ("reduce staff", "reduzir equipe"),
+        ("focus on", "focar em"),
+        ("market rout", "queda forte do mercado"),
+        ("price could be near", "o preço pode estar perto de"),
+        ("three signs", "três sinais"),
+        ("says one indicator", "diz um indicador"),
+        ("violent upside", "alta violenta"),
+    ]
+    for a, b in phrases:
+        out = re.sub(re.escape(a), b, out, flags=re.I)
+
+    # palavras
+    def repl_word(m: re.Match) -> str:
+        w = m.group(0)
+        lw = w.lower()
+        if lw in _BASIC_MAP:
+            return _BASIC_MAP[lw]
+        return w
+
+    out = re.sub(r"[A-Za-z']+", repl_word, out)
+
+    # ajustes leves de pontuação
+    out = re.sub(r"\s+—\s+", " — ", out)
+    out = re.sub(r"\s+:\s+", ": ", out)
+    return out.strip()
 
 
 class NewsroomEngine:
     """
-    Engine de notícias:
-    - Aceita feeds via argumento OU pega do config.NEWS_RSS_FEEDS_EN
-    - fetch_lines() aceita (session opcional) e (limit opcional) e ignora kwargs extras
-    - Compatível com chamadas antigas e novas
+    Puxa headlines de RSS (principalmente cripto). Monta pares EN/PT.
+    - Sem link no texto final (só fontes no fim).
+    - Dedupe simples por título.
     """
 
-    def __init__(self, feeds_en: Optional[List[Union[str, Tuple[str, str]]]] = None):
-        if feeds_en is None:
-            feeds_en = getattr(config, "NEWS_RSS_FEEDS_EN", [])
-        self.feeds_en = feeds_en or []
+    def __init__(self, feeds_en: Optional[Sequence[Tuple[str, str]]] = None, *, cache_max: int = 64):
+        self.cache_max = max(10, int(cache_max))
+        self.feeds_en: List[Tuple[str, str]] = list(feeds_en or getattr(config, "NEWS_FEEDS_EN", []))
+        self._seen: List[str] = []
 
-    def _guess_source(self, url: str) -> str:
-        u = (url or "").lower()
-        if "coindesk" in u: return "CoinDesk"
-        if "cointelegraph" in u: return "Cointelegraph"
-        if "cryptoslate" in u: return "CryptoSlate"
-        if "cryptopotato" in u: return "CryptoPotato"
-        if "thedefiant" in u: return "The Defiant"
-        return "RSS"
+    def _seen_add(self, key: str):
+        key = (key or "").strip().lower()
+        if not key:
+            return
+        if key in self._seen:
+            return
+        self._seen.append(key)
+        if len(self._seen) > self.cache_max:
+            self._seen = self._seen[-self.cache_max :]
 
-    async def _parse_feed_url(self, url: str):
-        # feedparser.parse(url) faz I/O e pode bloquear; então jogamos pra thread
-        return await asyncio.to_thread(feedparser.parse, url)
+    def _seen_has(self, key: str) -> bool:
+        key = (key or "").strip().lower()
+        return bool(key) and (key in self._seen)
 
-    async def fetch_lines(self, session=None, *, limit: int | None = None, **_) -> tuple[list[NewsLine], list[str]]:
-        items: list[NewsLine] = []
-        sources: list[str] = []
+    async def fetch_lines(self, session=None, *, limit: Optional[int] = None, **_) -> Tuple[List[NewsLine], List[str]]:
+        """
+        Retorna (lines, sources). `session` existe só por compat.
+        """
+        out: List[NewsLine] = []
+        sources: List[str] = []
 
-        if not self.feeds_en:
-            return [], []
+        lim = int(limit) if limit is not None else 8
+        lim = max(1, min(lim, 12))
 
-        for it in self.feeds_en:
-            if isinstance(it, (tuple, list)) and len(it) == 2:
-                src, url = str(it[0]), str(it[1])
-            else:
-                url = str(it)
-                src = self._guess_source(url)
-
+        for source_name, url in self.feeds_en:
             try:
-                feed = await self._parse_feed_url(url)
-                if getattr(feed, "bozo", False):
-                    continue
-
-                sources.append(src)
-                for entry in (feed.entries or [])[:10]:
-                    en = _clean(getattr(entry, "title", ""))
-                    if not en:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:10]:
+                    title = _clean(getattr(entry, "title", "") or "")
+                    if not title:
                         continue
-                    pt = _pt_headline(en)
-                    items.append(NewsLine(pt=pt, en=en, source=src))
+
+                    # key p/ dedupe interno
+                    key = f"{source_name}::{title}".lower()
+                    if self._seen_has(key):
+                        continue
+
+                    en = _strip_site_suffix(title)
+                    pt = translate_to_pt(en)
+
+                    out.append(NewsLine(en=en, pt=pt, source=source_name))
+                    self._seen_add(key)
+
+                    if source_name not in sources:
+                        sources.append(source_name)
+
+                    if len(out) >= lim:
+                        break
+                if len(out) >= lim:
+                    break
             except Exception:
                 continue
 
-        # dedupe por EN
-        seen = set()
-        out: list[NewsLine] = []
-        for x in items:
-            k = (x.en or "").strip().lower()
-            if not k or k in seen:
-                continue
-            seen.add(k)
-            out.append(x)
-
-        # ✅ AQUI é onde o "limit" entra (com indentação correta)
-        if limit is not None:
-            out = out[: int(limit)]
-
-        return out, sorted(set(sources))
-
-    # compat com versões que chamam engine_news.fetch(...)
-    async def fetch(self, session=None, limit: int | None = None, **kwargs):
-        lines, sources = await self.fetch_lines(session, limit=limit, **kwargs)
-        pt = [x.pt for x in lines]
-        en = [x.en for x in lines]
-        translated_ok = True  # offline — sempre “ok” do ponto de vista do engine
-        return pt, en, sources, translated_ok
+        return out, sources
