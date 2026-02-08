@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
+
 import feedparser
 import config
 
@@ -22,39 +24,37 @@ def _clean(s: str) -> str:
 def _pt_headline(en: str) -> str:
     """
     Tradutor offline (sem API) focado em TÍTULOS.
-    Usa padrões comuns + dicionário leve.
+    Não é perfeito, mas melhora bastante a legibilidade sem depender de serviço externo.
     """
     t = _clean(en)
 
-    # padrões comuns de mercado
     patterns = [
         (r"^(?P<who>.+?) shares jump (?P<pct>\d+)% after (?P<why>.+)$",
-         lambda m: f"Ações da {m['who']} sobem {m['pct']}% após {m['why']}"),
+         lambda d: f"Ações da {d['who']} sobem {d['pct']}% após {d['why']}"),
         (r"^(?P<who>.+?) jumps (?P<pct>\d+)% after (?P<why>.+)$",
-         lambda m: f"{m['who']} sobe {m['pct']}% após {m['why']}"),
+         lambda d: f"{d['who']} sobe {d['pct']}% após {d['why']}"),
         (r"^(?P<who>.+?) rockets (?P<pct>\d+)%.*$",
-         lambda m: f"{m['who']} dispara {m['pct']}%"),
+         lambda d: f"{d['who']} dispara {d['pct']}%"),
         (r"^(?P<who>.+?) tumbles below (?P<lvl>[\$€£]?\d[\d,\.]+).*$",
-         lambda m: f"{m['who']} cai e fica abaixo de {m['lvl']}"),
+         lambda d: f"{d['who']} cai e fica abaixo de {d['lvl']}"),
         (r"^(?P<who>.+?) falls to (?P<lvl>[\$€£]?\d[\d,\.]+).*$",
-         lambda m: f"{m['who']} cai para {m['lvl']}"),
+         lambda d: f"{d['who']} cai para {d['lvl']}"),
         (r"^Three signs that (?P<who>.+?) price could be near (?P<why>.+)$",
-         lambda m: f"Três sinais de que o preço de {m['who']} pode estar perto de {m['why']}"),
+         lambda d: f"Três sinais de que o preço de {d['who']} pode estar perto de {d['why']}"),
         (r"^(?P<who>.+?) is under fire after (?P<why>.+)$",
-         lambda m: f"{m['who']} fica sob pressão após {m['why']}"),
+         lambda d: f"{d['who']} fica sob pressão após {d['why']}"),
         (r"^(?P<who>.+?) prepares to (?P<do>.+)$",
-         lambda m: f"{m['who']} se prepara para {m['do']}"),
+         lambda d: f"{d['who']} se prepara para {d['do']}"),
         (r"^(?P<who>.+?) to exit (?P<where>.+?), reduce staff by (?P<pct>\d+)%.*$",
-         lambda m: f"{m['who']} vai sair de {m['where']} e reduzir equipe em {m['pct']}%"),
+         lambda d: f"{d['who']} vai sair de {d['where']} e reduzir equipe em {d['pct']}%"),
     ]
 
     for rx, fn in patterns:
         m = re.match(rx, t, flags=re.IGNORECASE)
         if m:
             out = fn(m.groupdict())
-            return out[0].upper() + out[1:] if out else t
+            return (out[0].upper() + out[1:]) if out else t
 
-    # fallback por dicionário (melhora legibilidade)
     dict_map = {
         "shares": "ações",
         "jump": "sobem",
@@ -64,11 +64,8 @@ def _pt_headline(en: str) -> str:
         "falls": "cai",
         "drops": "cai",
         "plunges": "despenca",
-        "crash": "queda",
-        "approval": "aprovação",
         "market": "mercado",
         "under fire": "sob pressão",
-        "wipes out": "apaga",
         "retirement funds": "fundos de aposentadoria",
         "brutal": "forte",
         "trend": "tendência",
@@ -91,24 +88,43 @@ def _pt_headline(en: str) -> str:
     for a, b in dict_map.items():
         out = re.sub(rf"\b{re.escape(a)}\b", b, out, flags=re.IGNORECASE)
 
-    # capitaliza
-    if out:
-        out = out[0].upper() + out[1:]
-    return out
+    return (out[0].upper() + out[1:]) if out else out
+
 
 class NewsroomEngine:
-    def __init__(self, feeds_en=None):
-        # ✅ fallback: se não passar feeds_en, puxa do config
+    """
+    Engine de notícias:
+    - Aceita feeds via argumento OU pega do config.NEWS_RSS_FEEDS_EN
+    - fetch_lines() aceita (session opcional) e (limit opcional) e ignora kwargs extras
+    - Compatível com chamadas antigas e novas
+    """
+
+    def __init__(self, feeds_en: Optional[List[Union[str, Tuple[str, str]]]] = None):
         if feeds_en is None:
             feeds_en = getattr(config, "NEWS_RSS_FEEDS_EN", [])
         self.feeds_en = feeds_en or []
 
-    async def fetch_lines(self) -> tuple[list[NewsLine], list[str]]:
+    def _guess_source(self, url: str) -> str:
+        u = (url or "").lower()
+        if "coindesk" in u: return "CoinDesk"
+        if "cointelegraph" in u: return "Cointelegraph"
+        if "cryptoslate" in u: return "CryptoSlate"
+        if "cryptopotato" in u: return "CryptoPotato"
+        if "thedefiant" in u: return "The Defiant"
+        return "RSS"
+
+    async def _parse_feed_url(self, url: str):
+        # feedparser.parse(url) faz I/O e pode bloquear; então jogamos pra thread
+        return await asyncio.to_thread(feedparser.parse, url)
+
+    async def fetch_lines(self, session=None, *, limit: int | None = None, **_) -> tuple[list[NewsLine], list[str]]:
         items: list[NewsLine] = []
         sources: list[str] = []
 
+        if not self.feeds_en:
+            return [], []
+
         for it in self.feeds_en:
-            # aceita ("Nome", "URL") OU "URL"
             if isinstance(it, (tuple, list)) and len(it) == 2:
                 src, url = str(it[0]), str(it[1])
             else:
@@ -116,7 +132,7 @@ class NewsroomEngine:
                 src = self._guess_source(url)
 
             try:
-                feed = feedparser.parse(url)
+                feed = await self._parse_feed_url(url)
                 if getattr(feed, "bozo", False):
                     continue
 
@@ -134,19 +150,22 @@ class NewsroomEngine:
         seen = set()
         out: list[NewsLine] = []
         for x in items:
-            k = x.en.lower()
-            if k in seen:
+            k = (x.en or "").strip().lower()
+            if not k or k in seen:
                 continue
             seen.add(k)
             out.append(x)
 
-        return out[:12], sorted(set(sources))
+        # ✅ AQUI é onde o "limit" entra (com indentação correta)
+        if limit is not None:
+            out = out[: int(limit)]
 
-    def _guess_source(self, url: str) -> str:
-        u = (url or "").lower()
-        if "coindesk" in u: return "CoinDesk"
-        if "cointelegraph" in u: return "Cointelegraph"
-        if "cryptoslate" in u: return "CryptoSlate"
-        if "cryptopotato" in u: return "CryptoPotato"
-        if "thedefiant" in u: return "The Defiant"
-        return "RSS"
+        return out, sorted(set(sources))
+
+    # compat com versões que chamam engine_news.fetch(...)
+    async def fetch(self, session=None, limit: int | None = None, **kwargs):
+        lines, sources = await self.fetch_lines(session, limit=limit, **kwargs)
+        pt = [x.pt for x in lines]
+        en = [x.en for x in lines]
+        translated_ok = True  # offline — sempre “ok” do ponto de vista do engine
+        return pt, en, sources, translated_ok
