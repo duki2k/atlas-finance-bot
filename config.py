@@ -47,7 +47,7 @@ BINOMO_REF_LINK = "https://binomo-invitefriend.com/auth?invite_code=cdb1ad8837e4
 # 📰 NEWS (PT/EN) — fontes RSS (EN base)
 # IMPORTANTE: formato é LISTA DE TUPLAS (fonte, url)
 # ─────────────────────────────
-NEWS_RSS_FEEDS_EN: List[Tuple[str, str]] = [
+NEWS_RSS_FEEDS_EN = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"),
     ("Cointelegraph", "https://cointelegraph.com/rss"),
     ("CryptoSlate", "https://cryptoslate.com/feed/"),
