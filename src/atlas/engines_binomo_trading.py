@@ -130,11 +130,12 @@ class BinomoTradingEngine:
             s += 12.0
         return s
 
-    async def scan_best(self, yahoo, tickers: List[str], tf: str) -> Optional[TradeEntry]:
+    async def scan_candidates(self, yahoo, tickers: List[str], tf: str, limit: int = 10) -> List[TradeEntry]:
+        """Gera uma lista ranqueada de candidatos (qualidade > quantidade)."""
         now = datetime.now(BR_TZ)
         nxt = _next_slot(now, tf)
 
-        best: Optional[TradeEntry] = None
+        out: List[TradeEntry] = []
         for tkr in tickers:
             try:
                 # YahooData.chart(ticker, interval, range_="1d")
@@ -175,8 +176,8 @@ class BinomoTradingEngine:
 
                 # “break-like” simples: candle atual rompendo faixa recente
                 lookback = 20
-                hi = max(h[-(lookback+1):-1])
-                lo = min(l[-(lookback+1):-1])
+                hi = max(h[-(lookback + 1):-1])
+                lo = min(l[-(lookback + 1):-1])
                 break_like = (price > hi) or (price < lo)
 
                 score = self._score(abs_chg, ema_cross, break_like)
@@ -189,7 +190,7 @@ class BinomoTradingEngine:
                 if break_like:
                     why += " | rompimento recente"
 
-                cand = TradeEntry(
+                out.append(TradeEntry(
                     ticker=tkr,
                     tf=tf,
                     side=side,
@@ -204,14 +205,16 @@ class BinomoTradingEngine:
                     score=score,
                     why=why,
                     next_time_str=nxt.strftime("%H:%M"),
-                )
-
-                if best is None or cand.score > best.score:
-                    best = cand
+                ))
             except Exception:
                 continue
 
-        return best
+        out.sort(key=lambda x: x.score, reverse=True)
+        return out[: max(1, int(limit))]
+
+    async def scan_best(self, yahoo, tickers: List[str], tf: str) -> Optional[TradeEntry]:
+        cand = await self.scan_candidates(yahoo, tickers, tf, limit=1)
+        return cand[0] if cand else None
 
     def build_embed(self, entries: List[TradeEntry], tier: str) -> discord.Embed:
         now = datetime.now(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
@@ -248,7 +251,7 @@ class BinomoTradingEngine:
 
         ctas = []
         if binomo_ref:
-            ctas.append(f"🎯 {_masked('Acesse aqui e liberar acesso', binomo_ref)}")
+            ctas.append(f"🎯 {_masked('Acesse aqui e receba benefícios', binomo_ref)}")
         if discord_invite:
             ctas.append(f"🚀 {_masked('Entre no Discord e acompanhe ao vivo', discord_invite)}")
 
