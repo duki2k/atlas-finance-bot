@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Tuple, Union
 import feedparser
+import config
 
 
 @dataclass
@@ -95,9 +96,11 @@ def _pt_headline(en: str) -> str:
         out = out[0].upper() + out[1:]
     return out
 
-
 class NewsroomEngine:
-    def __init__(self, feeds_en: List[Union[str, Tuple[str, str]]]):
+    def __init__(self, feeds_en=None):
+        # ✅ fallback: se não passar feeds_en, puxa do config
+        if feeds_en is None:
+            feeds_en = getattr(config, "NEWS_RSS_FEEDS_EN", [])
         self.feeds_en = feeds_en or []
 
     async def fetch_lines(self) -> tuple[list[NewsLine], list[str]]:
