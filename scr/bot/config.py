@@ -2,18 +2,19 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')  # Adicione no Railway
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
-# 👇 EDIITE Estes IDs dos seus canais/roles Discord 👇
+# 👇 SEUS IDs AQUI 👇
 CHANNELS = {
-    'reports': 1234567890123456789,     # ID #farm-reports
-    'events': 1234567890123456789,     # ID #faction-events  
-    'leaderboard': 1234567890123456789 # ID #faction-leaderboard
+    'welcome_logs': 1486268009550188556,  # #welcome-logs
+    'admin_cmds': 1486639291739144212,    # #admin-cmds
+    'add_farms': 1486642954398466088,     # #add-farms (admin only)
+    'pvp_events': 1486645052653437059,    # #pvp-events
+    'leaderboard': 1486268011823366218
 }
 
 ROLES = {
-    'admin': 1234567890123456789,      # Role admin para !resetweek
-    'farm_king': 1234567890123456789   # Role PREMIUM semanal
+    'admin': [1486268008409206867, 1486268008409206866, 1486268008409206864],
+    'pvp_member': 1486268008266596448,   # Para participar PVP
+    'farm_king': 1486268008409206864
 }
-
-WEEK_RESET_DAY = 0  # 0=Domingo
