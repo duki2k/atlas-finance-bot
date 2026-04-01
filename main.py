@@ -46,7 +46,7 @@ async def on_member_join(member):
         )
         embed.add_field(
             name="Comandos principais",
-            value="`/farm` ` /top` ` /pvpevent` ` /tutorial`",
+            value="`/farm` `/top` `/pvpevent` `/tutorial`",
             inline=False
         )
         embed.set_footer(text="Mensagem automática de boas-vindas")
@@ -68,26 +68,37 @@ async def on_member_remove(member):
 @app_commands.describe(
     membro="Nome do membro que recebeu o farm",
     qtd="Quantidade farmada",
-    tipo="Tipo do farm, ex: un, k, pts"
+    farm="Escolha o tipo de farm"
 )
-async def farm(interaction: discord.Interaction, membro: str, qtd: float, tipo: str = "un"):
+@app_commands.choices(farm=[
+    app_commands.Choice(name="Pedra", value="Pedra"),
+    app_commands.Choice(name="Semente", value="Semente"),
+])
+async def farm(
+    interaction: discord.Interaction,
+    membro: str,
+    qtd: float,
+    farm: app_commands.Choice[str]
+):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("❌ Apenas admins podem usar esse comando.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Apenas admins podem usar esse comando.",
+            ephemeral=True
+        )
         return
 
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     embed = discord.Embed(
         title="✅ Farm registrado",
-        description=(
-            f"**Membro:** {membro}\n"
-            f"**Quantidade:** {qtd}\n"
-            f"**Tipo:** {tipo}\n"
-            f"**Adicionado por:** {interaction.user.mention}"
-        ),
         color=0x00FF88
     )
+    embed.add_field(name="Membro", value=membro, inline=False)
+    embed.add_field(name="Farm desejado", value=farm.value, inline=True)
+    embed.add_field(name="Quantidade", value=f"{qtd} un", inline=True)
+    embed.add_field(name="Adicionado por", value=interaction.user.mention, inline=False)
     embed.set_footer(text=f"Registrado em {agora}")
+
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="top", description="Mostrar ranking semanal", guild=guild_obj)
@@ -103,7 +114,10 @@ async def top(interaction: discord.Interaction):
 @app_commands.describe(mensagem="Descrição do evento PVP")
 async def pvpevent(interaction: discord.Interaction, mensagem: str):
     if not isinstance(interaction.user, discord.Member) or not is_admin(interaction.user):
-        await interaction.response.send_message("❌ Apenas admins podem usar esse comando.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Apenas admins podem usar esse comando.",
+            ephemeral=True
+        )
         return
 
     embed = discord.Embed(
@@ -127,7 +141,12 @@ async def tutorial(interaction: discord.Interaction):
 
     embed.add_field(
         name="/farm",
-        value="Registra um farm. Uso: `/farm membro:Nome qtd:500 tipo:un` (somente admin).",
+        value=(
+            "Registra um farm para um membro.\n"
+            "Uso: `/farm membro:Nome qtd:500 farm:Pedra`\n"
+            "ou `/farm membro:Nome qtd:500 farm:Semente`\n"
+            "Somente admins podem usar."
+        ),
         inline=False
     )
     embed.add_field(
@@ -149,7 +168,8 @@ async def tutorial(interaction: discord.Interaction):
         name="Observações",
         value=(
             "- Digite `/` no chat para ver os comandos.\n"
-            "- Alguns comandos são exclusivos para admins.\n"
+            "- No `/farm`, o campo `farm` terá apenas as opções Pedra e Semente.\n"
+            "- A quantidade será exibida com `un` no embed.\n"
             "- O bot também envia mensagem de boas-vindas por DM."
         ),
         inline=False
